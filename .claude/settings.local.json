@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(../slang6/build/Debug/bin/slang-test:*)",
+      "Bash(./build/Debug/bin/slang-test:*)",
+      "Bash(echo:*)",
+      "Bash(cargo init:*)",
+      "Bash(cargo build:*)",
+      "Bash(./target/debug/slang-test-runner:*)",
+      "Bash(/tmp/mock-slang-test:*)",
+      "Bash(./target/release/slang-test-runner:*)",
+      "Bash(../slang-test-runner/target/debug/slang-test-runner:*)",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(cmake --build:*)",
+      "Bash(nix develop:*)",
+      "Bash(ninja slang-test:*)",
+      "Bash(timeout 90 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 180 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 60 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 120 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 30 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 30 ../slang-test-runner/target/debug/slang-test-runner:*)",
+      "Bash(timeout 20 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 10 ./target/debug/slang-test-runner:*)",
+      "Bash(timeout 15 ./target/debug/slang-test-runner:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
