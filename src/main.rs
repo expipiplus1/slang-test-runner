@@ -707,7 +707,7 @@ fn discover_test_files(
     ignore_patterns: &[String],
 ) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    let extensions = ["slang", "hlsl", "glsl"];
+    let extensions = ["slang", "hlsl", "glsl", "c"];
 
     for entry in WalkDir::new(test_dir)
         .follow_links(true)
@@ -748,7 +748,7 @@ static IGNORED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^ignored test: '([^']+)'").unwrap()
 });
 static BASE_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(.+\.(slang|hlsl|glsl))(\.\d+)?$").unwrap()
+    Regex::new(r"^(.+\.(slang|hlsl|glsl|c))(\.\d+)?$").unwrap()
 });
 
 fn parse_test_output(line: &str) -> Option<TestOutcome> {
@@ -1494,7 +1494,7 @@ impl TestRunner {
                 path.is_file()
                     && path
                         .extension()
-                        .is_some_and(|ext| ext == "slang" || ext == "hlsl" || ext == "glsl")
+                        .is_some_and(|ext| ext == "slang" || ext == "hlsl" || ext == "glsl" || ext == "c")
             });
 
         let has_internal_prefix = self
@@ -2282,7 +2282,7 @@ impl TestRunner {
             println!("\n{}", "To rerun failed tests:".yellow());
 
             // Use slang-test-runner if there are file-based tests
-            let has_file_tests = test_files.iter().any(|f| f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl"));
+            let has_file_tests = test_files.iter().any(|f| f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl") || f.ends_with(".c"));
 
             let exe = std::env::args().next().unwrap_or_else(|| "slang-test-runner".to_string());
             if has_file_tests {
