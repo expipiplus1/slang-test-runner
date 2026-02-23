@@ -1,21 +1,27 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
-use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sysinfo::{System, CpuRefreshKind, RefreshKind};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+// Constants
+const DEFAULT_PREDICTED_DURATION: f64 = 0.5;
+const EMA_NEW_WEIGHT: f64 = 0.7;
+const EMA_OLD_WEIGHT: f64 = 0.3;
+const BATCH_TIMEOUT_SECS: u64 = 300;
+const OUTPUT_TRUNCATE_LINES: usize = 30;
 
 /// Event logger for performance debugging
 #[derive(Debug)]
@@ -38,9 +44,19 @@ impl EventLog {
     fn log(&self, event: &str, details: &str) {
         let elapsed_ms = self.start_time.elapsed().as_millis();
         if let Ok(mut writer) = self.writer.lock() {
-            // Escape commas and newlines in details
-            let escaped = details.replace(',', ";").replace('\n', " ");
-            let _ = writeln!(writer, "{},{},{}", elapsed_ms, event, escaped);
+            let mut csv_writer = csv::WriterBuilder::new()
+                .has_headers(false)
+                .from_writer(Vec::new());
+            let record = [
+                elapsed_ms.to_string(),
+                event.to_string(),
+                details.to_string(),
+            ];
+            if csv_writer.write_record(&record).is_ok() {
+                if let Ok(data) = csv_writer.into_inner() {
+                    let _ = writer.write_all(&data);
+                }
+            }
         }
     }
 
@@ -52,7 +68,7 @@ impl EventLog {
 }
 
 /// Global event log (set once at startup if --event-log is provided)
-static EVENT_LOG: Lazy<Mutex<Option<Arc<EventLog>>>> = Lazy::new(|| Mutex::new(None));
+static EVENT_LOG: LazyLock<Mutex<Option<Arc<EventLog>>>> = LazyLock::new(|| Mutex::new(None));
 
 fn log_event(event: &str, details: &str) {
     if let Ok(guard) = EVENT_LOG.lock() {
@@ -64,8 +80,9 @@ fn log_event(event: &str, details: &str) {
 
 fn init_event_log(path: &PathBuf) -> Result<()> {
     let log = EventLog::new(path)?;
-    let mut guard = EVENT_LOG.lock().unwrap();
-    *guard = Some(Arc::new(log));
+    if let Ok(mut guard) = EVENT_LOG.lock() {
+        *guard = Some(Arc::new(log));
+    }
     Ok(())
 }
 
@@ -128,31 +145,47 @@ impl TimingCache {
         if *existing == 0.0 {
             *existing = duration;
         } else {
-            // 70% new, 30% old - adapts quickly but smooths outliers
-            *existing = duration * 0.7 + *existing * 0.3;
+            // EMA: adapts quickly but smooths outliers
+            *existing = duration * EMA_NEW_WEIGHT + *existing * EMA_OLD_WEIGHT;
         }
     }
 
     /// Predict total duration for a file given the API filter
-    fn predict(&self, file: &str, api_filter: Option<&str>) -> f64 {
+    /// If include_startup is true, adds startup overhead (for ETA).
+    /// If false, excludes startup (for scheduling decisions).
+    fn predict(&self, file: &str, api_filter: Option<&str>, include_startup: bool) -> f64 {
         if let Some(backends) = self.timings.get(file) {
-            match api_filter {
+            let base_time = match api_filter {
                 Some(api) => {
                     // Only count timing for the specified API
-                    backends.get(api).copied().unwrap_or(0.5)
+                    backends.get(api).copied().unwrap_or(DEFAULT_PREDICTED_DURATION)
                 }
                 None => {
-                    // Sum all backends except _total (which would double-count)
-                    let total: f64 = backends.iter()
-                        .filter(|(k, _)| *k != "_total")
-                        .map(|(_, v)| *v)
-                        .sum();
-                    if total > 0.0 { total } else { 0.5 }
+                    // Prefer _total (wall-clock time) as it includes compilation and overhead
+                    // Fall back to summing individual backends if _total not available
+                    if let Some(&total_time) = backends.get("_total") {
+                        total_time
+                    } else {
+                        let total: f64 = backends.iter()
+                            .filter(|(k, _)| *k != "_startup")
+                            .map(|(_, v)| *v)
+                            .sum();
+                        if total > 0.0 { total } else { DEFAULT_PREDICTED_DURATION }
+                    }
                 }
+            };
+
+            // Add startup overhead if requested (for ETA estimation)
+            // Excluded for scheduling decisions (batching, LPT sort)
+            if include_startup {
+                let startup = backends.get("_startup").copied().unwrap_or(0.0);
+                base_time + startup
+            } else {
+                base_time
             }
         } else {
             // Unknown file, use default estimate
-            0.5
+            DEFAULT_PREDICTED_DURATION
         }
     }
 
@@ -360,7 +393,6 @@ fn num_cpus() -> usize {
 
 /// Check if stderr is a TTY (interactive terminal)
 fn is_stderr_tty() -> bool {
-    use std::io::IsTerminal;
     std::io::stderr().is_terminal()
 }
 
@@ -474,9 +506,11 @@ struct WorkPool {
     files: Mutex<Vec<PathBuf>>,
     max_batch_size: usize,
     num_workers: usize,
-    /// Predicted duration per file (for ETA calculation)
+    /// Predicted duration per file (for scheduling, excludes startup)
     predictions: HashMap<String, f64>,
-    /// Total predicted time for all files
+    /// Startup overhead per file (for ETA calculation)
+    startups: HashMap<String, f64>,
+    /// Total predicted time for all files (including startup)
     total_predicted: f64,
     /// Whether we have real timing data (affects batching strategy)
     has_timing_data: bool,
@@ -490,28 +524,40 @@ impl WorkPool {
         max_batch_size: usize,
         num_workers: usize,
         predictions: HashMap<String, f64>,
+        startups: HashMap<String, f64>,
         has_timing_data: bool,
         target_batch_duration: f64,
     ) -> Self {
         let total_predicted: f64 = files.iter()
-            .map(|f| predictions.get(&f.to_string_lossy().to_string()).copied().unwrap_or(0.5))
+            .map(|f| {
+                let key = f.to_string_lossy().to_string();
+                let base = predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let startup = startups.get(&key).copied().unwrap_or(0.0);
+                base + startup
+            })
             .sum();
         Self {
             files: Mutex::new(files),
             max_batch_size,
             num_workers,
             predictions,
+            startups,
             total_predicted,
             has_timing_data,
             target_batch_duration,
         }
     }
 
-    /// Get predicted remaining time based on files in queue
+    /// Get predicted remaining time based on files in queue (includes startup for ETA)
     fn predicted_remaining(&self) -> f64 {
         let files = self.files.lock().unwrap();
         files.iter()
-            .map(|f| self.predictions.get(&f.to_string_lossy().to_string()).copied().unwrap_or(0.5))
+            .map(|f| {
+                let key = f.to_string_lossy().to_string();
+                let base = self.predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let startup = self.startups.get(&key).copied().unwrap_or(0.0);
+                base + startup
+            })
             .sum()
     }
 
@@ -543,7 +589,7 @@ impl WorkPool {
             let mut indexed: Vec<(usize, f64)> = files.iter().enumerate()
                 .map(|(i, f)| {
                     let key = f.to_string_lossy().to_string();
-                    let dur = self.predictions.get(&key).copied().unwrap_or(0.5);
+                    let dur = self.predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
                     (i, dur)
                 })
                 .collect();
@@ -602,7 +648,7 @@ impl WorkPool {
                 let idx = self.select_slow_biased_index(&files);
                 let file = &files[idx];
                 let file_key = file.to_string_lossy().to_string();
-                let file_duration = self.predictions.get(&file_key).copied().unwrap_or(0.5);
+                let file_duration = self.predictions.get(&file_key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
 
                 if batch.is_empty() {
                     batch.push(files.swap_remove(idx));
@@ -673,12 +719,8 @@ fn discover_test_files(
                         continue;
                     }
 
-                    if prefixes.is_empty() {
+                    if prefixes.is_empty() || prefixes.iter().any(|p| path_str.contains(p)) {
                         files.push(path.to_path_buf());
-                    } else {
-                        if prefixes.iter().any(|p| path_str.contains(p)) {
-                            files.push(path.to_path_buf());
-                        }
                     }
                 }
             }
@@ -690,16 +732,16 @@ fn discover_test_files(
 }
 
 // Static regexes for test output parsing (compiled once)
-static PASSED_RE: Lazy<Regex> = Lazy::new(|| {
+static PASSED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^passed test: '([^']+)'(?: (\d+\.?\d*)s)?").unwrap()
 });
-static FAILED_RE: Lazy<Regex> = Lazy::new(|| {
+static FAILED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^FAILED test: '([^']+)'").unwrap()
 });
-static IGNORED_RE: Lazy<Regex> = Lazy::new(|| {
+static IGNORED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^ignored test: '([^']+)'").unwrap()
 });
-static BASE_FILE_RE: Lazy<Regex> = Lazy::new(|| {
+static BASE_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(.+\.(slang|hlsl|glsl))(\.\d+)?$").unwrap()
 });
 
@@ -811,7 +853,7 @@ struct ProgressDisplay {
     total_predicted_time: f64,
     start_time: Instant,
     machine_output: bool,
-    last_reported_count: AtomicUsize,
+    last_reported_files: AtomicUsize,
 }
 
 impl ProgressDisplay {
@@ -821,7 +863,7 @@ impl ProgressDisplay {
             total_predicted_time,
             start_time: Instant::now(),
             machine_output,
-            last_reported_count: AtomicUsize::new(0),
+            last_reported_files: AtomicUsize::new(0),
         }
     }
 
@@ -829,14 +871,15 @@ impl ProgressDisplay {
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
-        let total_tests = passed + failed + ignored;
+        let _total_tests = passed + failed + ignored;
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
         if self.machine_output {
-            // In machine mode, report every 100 tests
-            let last_count = self.last_reported_count.load(Ordering::SeqCst);
-            if total_tests >= last_count + 100 {
-                self.last_reported_count.store(total_tests, Ordering::SeqCst);
+            // In machine mode, report every 10% of files completed
+            let last_files = self.last_reported_files.load(Ordering::SeqCst);
+            let report_interval = (self.total_files / 10).max(1); // Report every 10%, at least every file
+            if files_completed >= last_files + report_interval {
+                self.last_reported_files.store(files_completed, Ordering::SeqCst);
                 let turbo = if adaptive_running > 0 { format!(" +{} turbo", adaptive_running) } else { String::new() };
                 eprintln!(
                     "[{}/{}] {} passed, {} failed, {} ignored ({:.1}s) [{}/{}]{}",
@@ -915,6 +958,116 @@ impl ProgressDisplay {
     }
 }
 
+/// Context for batch execution - bundles related parameters
+struct BatchContext<'a> {
+    slang_test: &'a PathBuf,
+    test_files: &'a [PathBuf],
+    extra_args: &'a [String],
+    timeout: Duration,
+    stats: &'a TestStats,
+    failures: &'a Mutex<Vec<FailureInfo>>,
+    max_retries: usize,
+    retried_tests: &'a Mutex<HashSet<String>>,
+    work_pool: &'a Arc<WorkPool>,
+    running: &'a AtomicUsize,
+    machine_output: bool,
+    verbose: bool,
+}
+
+/// Determines if and how a failed test should be retried
+fn should_retry_test(
+    outcome: &TestOutcome,
+    max_retries: usize,
+    retried_tests: &Mutex<HashSet<String>>,
+    work_pool: &Arc<WorkPool>,
+) -> bool {
+    if max_retries == 0 {
+        return false;
+    }
+
+    let should_retry = {
+        let mut retried = retried_tests.lock().unwrap();
+        if retried.contains(&outcome.name) {
+            false // Already retried
+        } else {
+            retried.insert(outcome.name.clone());
+            true
+        }
+    };
+
+    if should_retry {
+        if let Some(base_file) = extract_base_test_file(&outcome.name) {
+            let file_path = PathBuf::from(&base_file);
+            if file_path.exists() {
+                work_pool.add_file(file_path);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Process a single test outcome, updating stats and handling retries
+/// Returns true if the outcome was a retry (and should be skipped for failure recording)
+fn process_outcome(
+    outcome: TestOutcome,
+    ctx: &BatchContext,
+    failed_outcomes: &mut Vec<TestOutcome>,
+) -> bool {
+    // Record the file as seen and its duration
+    if let Some(base_file) = extract_base_test_file(&outcome.name) {
+        ctx.stats.record_file(&base_file);
+        if let Some(duration) = outcome.duration {
+            ctx.stats.record_duration(&base_file, duration);
+        }
+    }
+
+    match outcome.result {
+        TestResult::Passed => {
+            let was_retry = ctx.retried_tests.lock().unwrap().contains(&outcome.name);
+            ctx.stats.passed.fetch_add(1, Ordering::SeqCst);
+            if was_retry {
+                ctx.stats.retried_and_passed.fetch_add(1, Ordering::SeqCst);
+            }
+            false
+        }
+        TestResult::Ignored => {
+            ctx.stats.ignored.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        TestResult::Failed => {
+            if should_retry_test(&outcome, ctx.max_retries, ctx.retried_tests, ctx.work_pool) {
+                return true; // Skip recording as failure, will be retried
+            }
+            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            failed_outcomes.push(outcome);
+            false
+        }
+    }
+}
+
+/// Collect failure output from stderr lines for failed tests
+fn collect_failure_output(failed_outcomes: &mut [TestOutcome], stderr_lines: &[String]) {
+    for outcome in failed_outcomes.iter_mut() {
+        let test_prefix = format!("[{}]", outcome.name);
+        let mut capture = false;
+        let mut relevant_lines: Vec<String> = Vec::new();
+
+        for line in stderr_lines {
+            if line.starts_with(&test_prefix) {
+                capture = true;
+            }
+            if capture {
+                relevant_lines.push(line.clone());
+                if line.contains("}}}") && relevant_lines.iter().filter(|l| l.contains("}}}")).count() >= 2 {
+                    break;
+                }
+            }
+        }
+        outcome.failure_output = relevant_lines;
+    }
+}
+
 /// Run a batch with work pool - sends retries back to the pool
 fn run_batch_with_pool(
     slang_test: &PathBuf,
@@ -930,23 +1083,37 @@ fn run_batch_with_pool(
     machine_output: bool,
     verbose: bool,
 ) {
+    let ctx = BatchContext {
+        slang_test,
+        test_files,
+        extra_args,
+        timeout,
+        stats,
+        failures,
+        max_retries,
+        retried_tests,
+        work_pool,
+        running,
+        machine_output,
+        verbose,
+    };
     // Track that this batch is now running
-    running.fetch_add(1, Ordering::SeqCst);
+    ctx.running.fetch_add(1, Ordering::SeqCst);
     let batch_start = Instant::now();
     let batch_id = std::thread::current().id();
-    let file_info: Vec<_> = test_files.iter()
+    let file_info: Vec<_> = ctx.test_files.iter()
         .map(|f| {
             let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
             let key = f.to_string_lossy().to_string();
-            let pred = work_pool.predictions.get(&key).copied().unwrap_or(0.0);
+            let pred = ctx.work_pool.predictions.get(&key).copied().unwrap_or(0.0);
             format!("{}({:.2}s)", name, pred)
         })
         .collect();
-    let total_pred: f64 = test_files.iter()
-        .map(|f| work_pool.predictions.get(&f.to_string_lossy().to_string()).copied().unwrap_or(0.0))
+    let total_pred: f64 = ctx.test_files.iter()
+        .map(|f| ctx.work_pool.predictions.get(&f.to_string_lossy().to_string()).copied().unwrap_or(0.0))
         .sum();
     log_event("batch_start", &format!("{:?} files={} pred={:.2}s items=[{}]",
-        batch_id, test_files.len(), total_pred, file_info.join(" ")));
+        batch_id, ctx.test_files.len(), total_pred, file_info.join(" ")));
 
     // Track sum of individual test durations for overhead calculation
     let test_time_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -973,7 +1140,7 @@ fn run_batch_with_pool(
         }
     }
     let _guard = Guard {
-        running,
+        running: ctx.running,
         batch_id,
         start: batch_start,
         pred_ms: (total_pred * 1000.0) as u64,
@@ -985,20 +1152,16 @@ fn run_batch_with_pool(
         return;
     }
 
-    let mut cmd = Command::new(slang_test);
-    for file in test_files {
-        cmd.arg(file);
-    }
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let mut cmd = Command::new(ctx.slang_test);
+    cmd.args(ctx.test_files)
+        .args(ctx.extra_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("ERROR: Failed to spawn slang-test: {}", e);
             return;
         }
     };
@@ -1011,30 +1174,40 @@ fn run_batch_with_pool(
     // Channel for file timing: (file, backend, duration_secs)
     let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, String, f64)>();
 
+    // Capture machine_output for thread closures
+    let machine_output_for_stderr = ctx.machine_output;
+    let num_files_in_batch = ctx.test_files.len();
+    let batch_start_time = Instant::now();
+
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut seen_tests: HashSet<String> = HashSet::new();
 
         // Track timing between test output lines
-        // None until we see the end of startup spiel (to exclude startup time)
         let mut last_test_time: Option<Instant> = None;
         let mut current_file: Option<String> = None;
         let mut file_start = Instant::now();
+        let mut startup_time_per_file: Option<f64> = None;
 
         for line in reader.lines() {
             if is_interrupted() {
                 break;
             }
             if let Ok(line) = line {
-                // Detect startup spiel lines - these reset the timer baseline
-                // so the first actual test gets valid timing
+                // Detect startup/preamble lines
+                // When we see the last preamble, calculate startup time
                 if line.starts_with("Supported backends:")
                     || line.starts_with("Check ")
                     || line.starts_with("Retrying ")
                 {
                     let now = Instant::now();
+                    // Calculate startup time from batch start to this preamble line
+                    let startup_time = batch_start_time.elapsed().as_secs_f64();
+                    if num_files_in_batch > 0 {
+                        startup_time_per_file = Some(startup_time / num_files_in_batch as f64);
+                    }
                     last_test_time = Some(now);
-                    file_start = now;  // Also reset file_start to exclude startup from _total
+                    file_start = now;  // Reset file_start to exclude startup from _total
                     continue;
                 }
 
@@ -1096,6 +1269,13 @@ fn run_batch_with_pool(
             let _ = timing_tx.send((prev_file.clone(), "_total".to_string(), duration));
         }
 
+        // Record startup time for all files we saw
+        if let Some(startup) = startup_time_per_file {
+            for file in &seen_tests {
+                let _ = timing_tx.send((file.clone(), "_startup".to_string(), startup));
+            }
+        }
+
         seen_tests
     });
 
@@ -1109,7 +1289,7 @@ fn run_batch_with_pool(
                     // Other workers should kill their processes and wait
                     set_compiling_core(true);
                     let _ = compiling_tx.send(true);
-                    if machine_output {
+                    if machine_output_for_stderr {
                         eprintln!("INFO: {}", line);
                     }
                 } else if line.contains("Compiling") {
@@ -1135,7 +1315,7 @@ fn run_batch_with_pool(
 
         // Check for compiling signals from THIS batch
         while let Ok(is_compiling) = compiling_rx.try_recv() {
-            stats.set_compiling(is_compiling);
+            ctx.stats.set_compiling(is_compiling);
             if is_compiling {
                 this_batch_is_compiling = true;
             }
@@ -1151,24 +1331,17 @@ fn run_batch_with_pool(
 
         // Process timing data
         while let Ok((file, backend, duration)) = timing_rx.try_recv() {
-            stats.record_observed_timing(&file, &backend, duration);
+            ctx.stats.record_observed_timing(&file, &backend, duration);
         }
 
         while let Ok(outcome) = outcome_rx.try_recv() {
             // Test output means compilation is done and we're making progress
-            stats.set_compiling(false);
-            stats.record_test_output();
+            ctx.stats.set_compiling(false);
+            ctx.stats.record_test_output();
             // If we were compiling core module, signal that we're done
             if this_batch_is_compiling {
                 set_compiling_core(false);
                 this_batch_is_compiling = false;
-            }
-            // Record the file as seen and its duration
-            if let Some(base_file) = extract_base_test_file(&outcome.name) {
-                stats.record_file(&base_file);
-                if let Some(duration) = outcome.duration {
-                    stats.record_duration(&base_file, duration);
-                }
             }
             // Log test result and track timing
             let result_str = match outcome.result {
@@ -1181,52 +1354,13 @@ fn run_batch_with_pool(
             test_count.fetch_add(1, Ordering::SeqCst);
             log_event("test", &format!("{:?} {} {} duration_ms={}", batch_id, result_str, outcome.name, duration_ms));
 
-            match outcome.result {
-                TestResult::Passed => {
-                    // Check if this was a retry
-                    let was_retry = retried_tests.lock().unwrap().contains(&outcome.name);
-                    stats.passed.fetch_add(1, Ordering::SeqCst);
-                    if was_retry {
-                        stats.retried_and_passed.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-                TestResult::Ignored => {
-                    stats.ignored.fetch_add(1, Ordering::SeqCst);
-                }
-                TestResult::Failed => {
-                    let should_retry = {
-                        let mut retried = retried_tests.lock().unwrap();
-                        if retried.contains(&outcome.name) {
-                            false // Already retried
-                        } else if max_retries > 0 {
-                            retried.insert(outcome.name.clone());
-                            true
-                        } else {
-                            false
-                        }
-                    };
-
-                    if should_retry {
-                        if let Some(base_file) = extract_base_test_file(&outcome.name) {
-                            let file_path = PathBuf::from(&base_file);
-                            if file_path.exists() {
-                                // Add back to work pool for retry
-                                work_pool.add_file(file_path);
-                                continue;
-                            }
-                        }
-                    }
-
-                    stats.failed.fetch_add(1, Ordering::SeqCst);
-                    failed_outcomes.push(outcome);
-                }
-            }
+            process_outcome(outcome, &ctx, &mut failed_outcomes);
         }
 
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if start.elapsed() > timeout {
+                if start.elapsed() > ctx.timeout {
                     let _ = child.kill();
                     break;
                 }
@@ -1239,79 +1373,34 @@ fn run_batch_with_pool(
 
     let loop_time = start.elapsed();
     // Warn if loop took much longer than expected (only show repro in verbose mode)
-    if verbose && loop_time.as_secs() > 30 {
-        let extra_args_str = if extra_args.is_empty() {
+    if ctx.verbose && loop_time.as_secs() > 30 {
+        let extra_args_str = if ctx.extra_args.is_empty() {
             String::new()
         } else {
-            format!(" {}", extra_args.join(" "))
+            format!(" {}", ctx.extra_args.join(" "))
         };
         eprintln!("\nWARNING: Batch took {:.1}s", loop_time.as_secs_f64());
         eprintln!("  Reproduce: time {} {}{}",
-            slang_test.display(),
-            test_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),
+            ctx.slang_test.display(),
+            ctx.test_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),
             extra_args_str
         );
     }
 
     // Process remaining timing data
     while let Ok((file, backend, duration)) = timing_rx.try_recv() {
-        stats.record_observed_timing(&file, &backend, duration);
+        ctx.stats.record_observed_timing(&file, &backend, duration);
     }
 
     // Process remaining outcomes
     while let Ok(outcome) = outcome_rx.try_recv() {
-        // Record the file as seen and its duration
-        if let Some(base_file) = extract_base_test_file(&outcome.name) {
-            stats.record_file(&base_file);
-            if let Some(duration) = outcome.duration {
-                stats.record_duration(&base_file, duration);
-            }
-        }
-        match outcome.result {
-            TestResult::Passed => {
-                let was_retry = retried_tests.lock().unwrap().contains(&outcome.name);
-                stats.passed.fetch_add(1, Ordering::SeqCst);
-                if was_retry {
-                    stats.retried_and_passed.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            TestResult::Ignored => {
-                stats.ignored.fetch_add(1, Ordering::SeqCst);
-            }
-            TestResult::Failed => {
-                let should_retry = {
-                    let mut retried = retried_tests.lock().unwrap();
-                    if retried.contains(&outcome.name) {
-                        false
-                    } else if max_retries > 0 {
-                        retried.insert(outcome.name.clone());
-                        true
-                    } else {
-                        false
-                    }
-                };
-
-                if should_retry {
-                    if let Some(base_file) = extract_base_test_file(&outcome.name) {
-                        let file_path = PathBuf::from(&base_file);
-                        if file_path.exists() {
-                            // Add back to work pool for retry
-                            work_pool.add_file(file_path);
-                            continue;
-                        }
-                    }
-                }
-
-                stats.failed.fetch_add(1, Ordering::SeqCst);
-                failed_outcomes.push(outcome);
-            }
-        }
+        process_outcome(outcome, &ctx, &mut failed_outcomes);
     }
 
     // If we were killed because another batch is compiling, return our files to the pool
     if killed_for_compilation {
-        for file in test_files {
-            work_pool.add_file(file.clone());
+        for file in ctx.test_files {
+            ctx.work_pool.add_file(file.clone());
         }
         // Wait for compilation to finish before returning
         while is_compiling_core() && !is_interrupted() {
@@ -1334,37 +1423,17 @@ fn run_batch_with_pool(
         eprintln!("\nWARNING: Slow thread joins - stdout: {:.1}s, stderr: {:.1}s for {:?}",
             stdout_join_time.as_secs_f64(),
             stderr_join_time.as_secs_f64(),
-            test_files.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>()
+            ctx.test_files.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>()
         );
     }
 
-    let mut stderr_lines: Vec<String> = Vec::new();
-    while let Ok(line) = stderr_rx.try_recv() {
-        stderr_lines.push(line);
-    }
+    let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
 
-    for outcome in &mut failed_outcomes {
-        let test_prefix = format!("[{}]", outcome.name);
-        let mut capture = false;
-        let mut relevant_lines: Vec<String> = Vec::new();
-
-        for line in &stderr_lines {
-            if line.starts_with(&test_prefix) {
-                capture = true;
-            }
-            if capture {
-                relevant_lines.push(line.clone());
-                if line.contains("}}}") && relevant_lines.iter().filter(|l| l.contains("}}}")).count() >= 2 {
-                    break;
-                }
-            }
-        }
-        outcome.failure_output = relevant_lines;
-    }
+    collect_failure_output(&mut failed_outcomes, &stderr_lines);
 
     for outcome in failed_outcomes {
         let info = parse_failure_info(&outcome.name, &outcome.failure_output);
-        failures.lock().unwrap().push(info);
+        ctx.failures.lock().unwrap().push(info);
     }
 }
 
@@ -1403,10 +1472,11 @@ impl TestRunner {
     }
 
     /// Get predicted duration for a file based on cached timing
+    /// Does NOT include startup overhead (used for scheduling decisions)
     fn predict_duration(&self, file: &PathBuf) -> f64 {
         let api_filter = extract_api_filter(&self.args.extra_args);
         let cache = self.timing_cache.lock().unwrap();
-        cache.predict(&file.to_string_lossy(), api_filter.as_deref())
+        cache.predict(&file.to_string_lossy(), api_filter.as_deref(), false)
     }
 
     fn run(&self) -> Result<bool> {
@@ -1472,16 +1542,10 @@ impl TestRunner {
             cmd.arg("-hide-ignored");
         }
 
-        for prefix in &self.args.prefixes {
-            cmd.arg(prefix);
-        }
-
-        for arg in &self.args.extra_args {
-            cmd.arg(arg);
-        }
-
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.args(&self.args.prefixes)
+            .args(&self.args.extra_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("Failed to spawn slang-test")?;
         let stdout = child.stdout.take().unwrap();
@@ -1494,10 +1558,12 @@ impl TestRunner {
         // Simple progress for prefix mode - we don't know total count
         let progress_stats = stats.clone();
         let machine_output = self.machine_output;
+        let progress_shutdown = Arc::new(AtomicBool::new(false));
+        let progress_shutdown_clone = progress_shutdown.clone();
         let progress_handle = thread::spawn(move || {
             let start = Instant::now();
             let mut last_total = 0;
-            loop {
+            while !progress_shutdown_clone.load(Ordering::SeqCst) {
                 let passed = progress_stats.passed.load(Ordering::SeqCst);
                 let failed = progress_stats.failed.load(Ordering::SeqCst);
                 let ignored = progress_stats.ignored.load(Ordering::SeqCst);
@@ -1522,12 +1588,6 @@ impl TestRunner {
                 }
 
                 thread::sleep(Duration::from_millis(100));
-
-                // Check if we should stop (stats stopped changing for a while)
-                // This is a simple heuristic
-                if total > 0 {
-                    thread::sleep(Duration::from_millis(100));
-                }
             }
         });
 
@@ -1612,8 +1672,9 @@ impl TestRunner {
         }
         drop(failures_guard);
 
-        // Stop progress thread (it will be killed when we drop the handle)
-        drop(progress_handle);
+        // Stop progress thread
+        progress_shutdown.store(true, Ordering::SeqCst);
+        let _ = progress_handle.join();
         if !self.machine_output {
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
@@ -1669,21 +1730,27 @@ impl TestRunner {
             test_files.to_vec()
         };
 
-        // Build predictions map for ETA calculation
-        let predictions: HashMap<String, f64> = {
+        // Build predictions map (without startup - used for scheduling)
+        // and startups map (for ETA calculation)
+        let (predictions, startups): (HashMap<String, f64>, HashMap<String, f64>) = {
             let api_filter = extract_api_filter(&self.args.extra_args);
             let cache = self.timing_cache.lock().unwrap();
             sorted_files.iter()
                 .map(|f| {
                     let key = f.to_string_lossy().to_string();
-                    let pred = cache.predict(&key, api_filter.as_deref());
-                    (key, pred)
+                    let pred = cache.predict(&key, api_filter.as_deref(), false);
+                    let startup = cache.timings.get(&key)
+                        .and_then(|backends| backends.get("_startup").copied())
+                        .unwrap_or(0.0);
+                    ((key.clone(), pred), (key, startup))
                 })
-                .collect()
+                .unzip()
         };
 
         if has_timing_data {
-            let total_predicted: f64 = predictions.values().sum();
+            let total_predicted: f64 = predictions.values().zip(startups.values())
+                .map(|(pred, startup)| pred + startup)
+                .sum();
             eprintln!(
                 "Running {} test files with {} workers (predicted {:.0}s with cached timing)",
                 test_files.len(),
@@ -1704,6 +1771,7 @@ impl TestRunner {
             self.args.batch_size,
             self.args.jobs,
             predictions,
+            startups,
             has_timing_data,
             self.args.batch_duration,
         ));
@@ -1787,7 +1855,7 @@ impl TestRunner {
                                 &slang_test,
                                 &batch,
                                 &extra_args,
-                                Duration::from_secs(300),
+                                Duration::from_secs(BATCH_TIMEOUT_SECS),
                                 &stats,
                                 &failures,
                                 retries,
@@ -1862,7 +1930,7 @@ impl TestRunner {
                                         &slang_test,
                                         &batch,
                                         &extra_args,
-                                        Duration::from_secs(300),
+                                        Duration::from_secs(BATCH_TIMEOUT_SECS),
                                         &stats,
                                         &failures,
                                         retries,
@@ -2079,7 +2147,7 @@ impl TestRunner {
                                 && !l.contains("Supported backends:")
                                 && !l.contains("Check ")
                         })
-                        .take(30)
+                        .take(OUTPUT_TRUNCATE_LINES)
                         .collect();
 
                     for line in relevant_lines {
@@ -2089,7 +2157,7 @@ impl TestRunner {
                             println!("  {}", line.dimmed());
                         }
                     }
-                    if failure.output_lines.len() > 30 {
+                    if failure.output_lines.len() > OUTPUT_TRUNCATE_LINES {
                         if self.machine_output {
                             println!("(truncated) ...");
                         } else {
@@ -2104,27 +2172,51 @@ impl TestRunner {
         println!("\n{}", "=".repeat(70));
 
         let total_run = passed + failed;
+        let interrupted = is_interrupted();
+
         if total_run > 0 {
-            let pass_pct = (passed as f64 / total_run as f64) * 100.0;
-            if failed == 0 {
-                println!(
-                    "{}: {:.0}% passed ({} passed, {} ignored) in {:.1}s",
-                    "OK".green().bold(),
-                    pass_pct,
-                    passed,
-                    ignored,
-                    elapsed.as_secs_f64()
-                );
+            if interrupted {
+                // When interrupted, don't show percentage as it's misleading
+                if failed == 0 {
+                    println!(
+                        "{}: {} passed, {} ignored in {:.1}s (incomplete - interrupted)",
+                        "INTERRUPTED".yellow().bold(),
+                        passed,
+                        ignored,
+                        elapsed.as_secs_f64()
+                    );
+                } else {
+                    println!(
+                        "{}: {} passed, {} failed, {} ignored in {:.1}s (incomplete - interrupted)",
+                        "INTERRUPTED".yellow().bold(),
+                        passed,
+                        failed,
+                        ignored,
+                        elapsed.as_secs_f64()
+                    );
+                }
             } else {
-                println!(
-                    "{}: {:.0}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
-                    "FAILED".red().bold(),
-                    pass_pct,
-                    passed,
-                    failed,
-                    ignored,
-                    elapsed.as_secs_f64()
-                );
+                let pass_pct = (passed as f64 / total_run as f64) * 100.0;
+                if failed == 0 {
+                    println!(
+                        "{}: {:.0}% passed ({} passed, {} ignored) in {:.1}s",
+                        "OK".green().bold(),
+                        pass_pct,
+                        passed,
+                        ignored,
+                        elapsed.as_secs_f64()
+                    );
+                } else {
+                    println!(
+                        "{}: {:.0}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
+                        "FAILED".red().bold(),
+                        pass_pct,
+                        passed,
+                        failed,
+                        ignored,
+                        elapsed.as_secs_f64()
+                    );
+                }
             }
         } else {
             println!("No tests run");
