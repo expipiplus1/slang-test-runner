@@ -552,9 +552,8 @@ impl WorkPool {
             // One-sided exponential decay: strongly favor slow tests (index 0)
             // but occasionally pick faster ones
             // Weight = e^(-index * decay_factor)
-            // Tighter curve: decay=6/n means last item has ~0.25% weight vs first (was 5% before)
             let n = indexed.len();
-            let decay = 6.0 / n as f64; // Stronger bias toward slow tests
+            let decay = 3.0 / n as f64; // Decay such that last item has ~5% weight of first
             let weights: Vec<f64> = (0..n)
                 .map(|i| (-decay * i as f64).exp())
                 .collect();
@@ -1635,10 +1634,9 @@ impl TestRunner {
             !cache.timings.is_empty()
         };
 
-        // Schedule files using strict LPT for top N, then interleaved for rest:
-        // 1. Top N slowest tests go to positions 0..N (first N batches, deterministic)
-        // 2. Remaining tests use interleaved LPT (spread across workers)
-        // This guarantees the longest tests start in the first round of batches
+        // Schedule files using interleaved LPT (Longest Processing Time First)
+        // Deal slow tests like cards across worker positions, then fill with fast tests
+        // This ensures each worker gets a mix of slow and fast tests
         let sorted_files: Vec<PathBuf> = if has_timing_data {
             let mut files_with_duration: Vec<_> = test_files.iter()
                 .map(|f| (f.clone(), self.predict_duration(f)))
@@ -1646,29 +1644,16 @@ impl TestRunner {
             // Sort by duration descending (slowest first)
             files_with_duration.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+            // Deal like cards: position i gets tests i, i+N, i+2N, ...
+            // This spreads slow tests across all batch positions
             let n = self.args.jobs;
-
-            // Take top N slowest tests - these will be scheduled first (positions 0..N)
-            let top_n: Vec<_> = files_with_duration.iter().take(n).map(|(f, _)| f.clone()).collect();
-
-            // Remaining tests get interleaved LPT
-            let remaining: Vec<_> = files_with_duration.into_iter().skip(n).collect();
-
             let mut slots: Vec<Vec<PathBuf>> = (0..n).map(|_| Vec::new()).collect();
 
-            // Put top N slowest in first position of each slot (deterministic)
-            for (i, file) in top_n.into_iter().enumerate() {
-                slots[i].push(file);
-            }
-
-            // Interleave remaining tests across slots
-            for (i, (file, _)) in remaining.into_iter().enumerate() {
+            for (i, (file, _)) in files_with_duration.into_iter().enumerate() {
                 slots[i % n].push(file);
             }
 
             // Flatten: first test from each slot, then second, etc.
-            // Result: positions [0, 1, 2, ..., N-1] = top N slowest tests
-            //         positions [N, N+1, ...] = remaining tests interleaved
             let mut result = Vec::with_capacity(test_files.len());
             let max_len = slots.iter().map(|s| s.len()).max().unwrap_or(0);
             for i in 0..max_len {
