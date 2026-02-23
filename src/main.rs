@@ -2138,19 +2138,19 @@ impl TestRunner {
             }
         }
 
-        // Show slowest files if we have timing data
-        let num_slowest = if self.args.verbose { 15 } else { 5 };
-        let slowest = self.stats.slowest_files(num_slowest);
-        if !slowest.is_empty() && slowest[0].1 > 1.0 {
-            println!("\n{}:", "Slowest files".yellow());
-            for (file, secs) in &slowest {
-                if *secs > 0.5 {
-                    println!("  {:>6.1}s  {}", secs, file);
+        // Show slowest files in verbose mode only
+        if self.args.verbose {
+            let num_slowest = 15;
+            let slowest = self.stats.slowest_files(num_slowest);
+            if !slowest.is_empty() && slowest[0].1 > 1.0 {
+                println!("\n{}:", "Slowest files".yellow());
+                for (file, secs) in &slowest {
+                    if *secs > 0.5 {
+                        println!("  {:>6.1}s  {}", secs, file);
+                    }
                 }
-            }
 
-            // In verbose mode, show per-backend breakdown for slowest files
-            if self.args.verbose {
+                // Show per-backend breakdown for slowest files
                 let observed = self.stats.get_observed_timings();
                 println!("\n{}:", "Per-backend timing (slowest files)".yellow());
                 for (file, _total_secs) in slowest.iter().take(5) {
