@@ -2,3 +2,4 @@
 Cargo.lock
 result
 result-*
+.claude/*
