@@ -357,6 +357,12 @@ fn main() -> Result<()> {
 
     // Fast path for dry-run: skip TestRunner creation, stream output
     if args.dry_run {
+        let is_tty = is_stderr_tty();
+        let is_debug_build = slang_test_path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("debug");
+
         let rx = discover_tests_streaming(
             &slang_test_path,
             &root_dir,
@@ -365,10 +371,39 @@ fn main() -> Result<()> {
         )?;
 
         let mut count = 0;
-        for test in rx {
-            println!("{}", test);
-            count += 1;
+        let mut shown_compiling = false;
+
+        loop {
+            // Try to receive with a timeout so we can show compiling message while waiting
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(test) => {
+                    // On first test output, clear any compiling message
+                    if count == 0 && shown_compiling && is_tty {
+                        eprint!("\r\x1b[K");
+                    }
+                    println!("{}", test);
+                    count += 1;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Still waiting - show compiling notice for debug builds
+                    if !shown_compiling && is_debug_build && is_tty {
+                        eprint!(
+                            "Compiling core module on debug build, this can take a while..."
+                        );
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        shown_compiling = true;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // Channel closed, we're done
+                    if shown_compiling && count == 0 && is_tty {
+                        eprint!("\r\x1b[K");
+                    }
+                    break;
+                }
+            }
         }
+
         eprintln!("{} tests would be run", count);
         std::process::exit(0);
     }

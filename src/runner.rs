@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::{*, TestId};
+use crate::types::{*, TestId, test_to_timing_key};
 
 // ============================================================================
 // Global Flags
@@ -266,9 +266,6 @@ fn process_outcome(
 ) -> bool {
     if let Some(base_file) = extract_base_test_file(&outcome.name) {
         ctx.stats.record_file(&base_file);
-        if let Some(duration) = outcome.duration {
-            ctx.stats.record_duration(&base_file, duration);
-        }
     }
 
     match outcome.result {
@@ -399,10 +396,16 @@ pub fn run_batch_with_pool(
         return;
     }
 
+    // Convert test names to the format slang-test accepts (strip API suffix)
+    let slang_test_args: Vec<String> = ctx.test_files
+        .iter()
+        .map(|f| TestId::parse(f).to_slang_test_arg())
+        .collect();
+
     let mut cmd = Command::new(ctx.slang_test);
     cmd.arg("-explicit-test-order")
         .arg("-disable-retries")
-        .args(ctx.test_files)
+        .args(&slang_test_args)
         .args(ctx.extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -420,12 +423,10 @@ pub fn run_batch_with_pool(
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
     let (stderr_tx, stderr_rx) = crossbeam_channel::unbounded::<String>();
-    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, String, f64)>();
+    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>(); // (test_id, duration)
     let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1); // Signal when output is complete
 
     let machine_output_for_stderr = ctx.machine_output;
-    let num_files_in_batch = ctx.test_files.len();
-    let batch_start_time = Instant::now();
 
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -433,9 +434,6 @@ pub fn run_batch_with_pool(
         let mut saw_summary = false;
 
         let mut last_test_time: Option<Instant> = None;
-        let mut current_file: Option<String> = None;
-        let mut file_start = Instant::now();
-        let mut startup_time_per_file: Option<f64> = None;
 
         for line in reader.lines() {
             if is_interrupted() {
@@ -454,13 +452,7 @@ pub fn run_batch_with_pool(
                     || line.starts_with("Check ")
                     || line.starts_with("Retrying ")
                 {
-                    let now = Instant::now();
-                    let startup_time = batch_start_time.elapsed().as_secs_f64();
-                    if num_files_in_batch > 0 {
-                        startup_time_per_file = Some(startup_time / num_files_in_batch as f64);
-                    }
-                    last_test_time = Some(now);
-                    file_start = now;
+                    last_test_time = Some(Instant::now());
                     continue;
                 }
 
@@ -484,37 +476,19 @@ pub fn run_batch_with_pool(
 
                     last_test_time = Some(now);
 
-                    if let Some(base) = extract_base_test_file(&outcome.name) {
-                        if should_record_timing {
-                            let backend = extract_backend(&outcome.name).unwrap_or_else(|| "_none".to_string());
-                            let _ = timing_tx.send((base.clone(), backend, test_duration));
-                        }
+                    // Extract the timing key: base file path + variant suffix (no backend/syn suffix)
+                    // e.g., "tests/foo.slang.4 syn (vk)" -> "tests/foo.slang.4"
+                    let test_id = TestId::parse(&outcome.name);
+                    let timing_key = test_id.to_timing_key();
 
-                        if current_file.as_ref() != Some(&base) {
-                            if let Some(ref prev_file) = current_file {
-                                let duration = file_start.elapsed().as_secs_f64();
-                                let _ = timing_tx.send((prev_file.clone(), "_total".to_string(), duration));
-                            }
-                            current_file = Some(base.clone());
-                            file_start = now;
-                        }
-
-                        seen_tests.insert(base);
+                    if should_record_timing {
+                        let _ = timing_tx.send((timing_key.clone(), test_duration));
                     }
+
+                    seen_tests.insert(timing_key);
 
                     let _ = outcome_tx.send(outcome);
                 }
-            }
-        }
-
-        if let Some(ref prev_file) = current_file {
-            let duration = file_start.elapsed().as_secs_f64();
-            let _ = timing_tx.send((prev_file.clone(), "_total".to_string(), duration));
-        }
-
-        if let Some(startup) = startup_time_per_file {
-            for file in &seen_tests {
-                let _ = timing_tx.send((file.clone(), "_startup".to_string(), startup));
             }
         }
 
@@ -566,8 +540,8 @@ pub fn run_batch_with_pool(
             break;
         }
 
-        while let Ok((file, backend, duration)) = timing_rx.try_recv() {
-            ctx.stats.record_observed_timing(&file, &backend, duration);
+        while let Ok((test_id, duration)) = timing_rx.try_recv() {
+            ctx.stats.record_observed_timing(&test_id, duration);
         }
 
         while let Ok(outcome) = outcome_rx.try_recv() {
@@ -628,8 +602,8 @@ pub fn run_batch_with_pool(
         );
     }
 
-    while let Ok((file, backend, duration)) = timing_rx.try_recv() {
-        ctx.stats.record_observed_timing(&file, &backend, duration);
+    while let Ok((test_id, duration)) = timing_rx.try_recv() {
+        ctx.stats.record_observed_timing(&test_id, duration);
     }
 
     while let Ok(outcome) = outcome_rx.try_recv() {
@@ -664,6 +638,25 @@ pub fn run_batch_with_pool(
 
     let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
 
+    // In verbose mode, report any tests that weren't accounted for in the output
+    if ctx.verbose && !is_interrupted() && !killed_for_compilation {
+        let mut unaccounted: Vec<&String> = Vec::new();
+        for file in ctx.test_files {
+            let test_id = TestId::parse(file);
+            let timing_key = test_id.to_timing_key();
+            if !seen_tests.contains(&timing_key) {
+                unaccounted.push(file);
+            }
+        }
+        if !unaccounted.is_empty() {
+            eprintln!("\nWARNING: {} unaccounted tests in batch:", unaccounted.len());
+            for test in &unaccounted {
+                eprintln!("  {}", test);
+            }
+            eprintln!("  seen_tests: {:?}", seen_tests);
+        }
+    }
+
     // Detect crash: if we didn't see the summary and weren't interrupted/killed for compilation
     if !saw_summary && !is_interrupted() && !killed_for_compilation {
         let exit_info = format_exit_status(exit_status.as_ref());
@@ -674,7 +667,8 @@ pub fn run_batch_with_pool(
 
         for file in ctx.test_files {
             let test_id = TestId::parse(file);
-            if !seen_tests.contains(&test_id.path) {
+            let timing_key = test_id.to_timing_key();
+            if !seen_tests.contains(&timing_key) {
                 crashed_test = Some(file.clone());
                 break;
             }
@@ -739,12 +733,6 @@ impl TestRunner {
         }
     }
 
-    fn predict_duration(&self, file: &str) -> f64 {
-        let api_filter = extract_api_filter(&self.args.extra_args);
-        let cache = self.timing_cache.lock().unwrap();
-        cache.predict(file, api_filter.as_deref(), false)
-    }
-
     pub fn run(&self) -> Result<bool> {
         let start_time = Instant::now();
 
@@ -770,7 +758,6 @@ impl TestRunner {
         let mut test_files: Vec<String> = Vec::new();
         let mut cache_for_display: Option<TimingCache> = None;
         let mut total_predicted: f64 = 0.0;
-        let api_filter = extract_api_filter(&self.args.extra_args);
 
         for test in rx {
             // Check if cache finished loading (non-blocking)
@@ -778,7 +765,7 @@ impl TestRunner {
                 if let Ok(cache) = cache_rx.try_recv() {
                     // Cache just loaded - compute predictions for all tests we've collected so far
                     total_predicted = test_files.iter()
-                        .map(|f| cache.predict(f, api_filter.as_deref(), true))
+                        .map(|f| cache.predict(&test_to_timing_key(f)))
                         .sum();
                     cache_for_display = Some(cache);
                 }
@@ -786,7 +773,7 @@ impl TestRunner {
 
             // Add prediction for this test incrementally (if cache is loaded)
             if let Some(ref cache) = cache_for_display {
-                total_predicted += cache.predict(&test, api_filter.as_deref(), true);
+                total_predicted += cache.predict(&test_to_timing_key(&test));
             }
 
             test_files.push(test);
@@ -867,9 +854,22 @@ impl TestRunner {
             !cache.timings.is_empty()
         };
 
+        // Build predictions map: test string -> predicted duration
+        // We use the timing key (path + variant) for lookups but store by full test string
+        let predictions: HashMap<String, f64> = {
+            let cache = self.timing_cache.lock().unwrap();
+            test_files.iter()
+                .map(|f| {
+                    let timing_key = test_to_timing_key(f);
+                    let pred = cache.predict(&timing_key);
+                    (f.clone(), pred)
+                })
+                .collect()
+        };
+
         let sorted_files: Vec<String> = if has_timing_data {
             let mut files_with_duration: Vec<_> = test_files.iter()
-                .map(|f| (f.clone(), self.predict_duration(f)))
+                .map(|f| (f.clone(), *predictions.get(f).unwrap_or(&DEFAULT_PREDICTED_DURATION)))
                 .collect();
             files_with_duration.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -894,24 +894,8 @@ impl TestRunner {
             test_files.to_vec()
         };
 
-        let (predictions, startups): (HashMap<String, f64>, HashMap<String, f64>) = {
-            let api_filter = extract_api_filter(&self.args.extra_args);
-            let cache = self.timing_cache.lock().unwrap();
-            sorted_files.iter()
-                .map(|f| {
-                    let pred = cache.predict(f, api_filter.as_deref(), false);
-                    let startup = cache.timings.get(f)
-                        .and_then(|backends| backends.get("_startup").copied())
-                        .unwrap_or(0.0);
-                    ((f.clone(), pred), (f.clone(), startup))
-                })
-                .unzip()
-        };
-
         if has_timing_data {
-            let total_predicted: f64 = predictions.values().zip(startups.values())
-                .map(|(pred, startup)| pred + startup)
-                .sum();
+            let total_predicted: f64 = predictions.values().sum();
             eprintln!(
                 "Running {} tests with {} workers (predicted {:.0}s with cached timing)",
                 test_files.len(),
@@ -931,7 +915,6 @@ impl TestRunner {
             self.args.batch_size,
             self.args.jobs,
             predictions,
-            startups,
             has_timing_data,
             self.args.batch_duration,
         ));
@@ -1352,30 +1335,17 @@ impl TestRunner {
         }
 
         if self.args.verbose {
-            let num_slowest = 15;
-            let slowest = self.stats.slowest_files(num_slowest);
-            if !slowest.is_empty() && slowest[0].1 > 1.0 {
-                println!("\n{}:", "Slowest files".yellow());
-                for (file, secs) in &slowest {
-                    if *secs > 0.5 {
-                        println!("  {:>6.1}s  {}", secs, file);
-                    }
-                }
+            let observed = self.stats.get_observed_timings();
+            if !observed.is_empty() {
+                let mut slowest: Vec<_> = observed.iter().collect();
+                slowest.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                slowest.truncate(15);
 
-                let observed = self.stats.get_observed_timings();
-                println!("\n{}:", "Per-backend timing (slowest files)".yellow());
-                for (file, _total_secs) in slowest.iter().take(5) {
-                    if let Some(backends) = observed.get(file) {
-                        let mut backend_list: Vec<_> = backends.iter()
-                            .filter(|(b, _)| *b != "_total")
-                            .collect();
-                        backend_list.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-                        if !backend_list.is_empty() {
-                            let backend_str: String = backend_list.iter()
-                                .map(|(b, s)| format!("{}:{:.1}s", b, s))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            println!("  {}  {}", file, backend_str.dimmed());
+                if !slowest.is_empty() && *slowest[0].1 > 1.0 {
+                    println!("\n{}:", "Slowest tests".yellow());
+                    for (test_id, secs) in &slowest {
+                        if **secs > 0.5 {
+                            println!("  {:>6.1}s  {}", secs, test_id);
                         }
                     }
                 }

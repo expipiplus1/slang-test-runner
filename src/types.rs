@@ -91,7 +91,7 @@ impl TestId {
         }
     }
 
-    /// Convert back to the string format expected by slang-test
+    /// Convert back to the full string format (for display)
     pub fn to_test_string(&self) -> String {
         let mut s = self.path.clone();
         if let Some(v) = self.variant {
@@ -105,12 +105,50 @@ impl TestId {
         }
         s
     }
+
+    /// Convert to the format that slang-test accepts as input (path + variant only)
+    /// This strips the API suffix and synthesized flag which are only for display
+    pub fn to_slang_test_arg(&self) -> String {
+        let mut s = self.path.clone();
+        if let Some(v) = self.variant {
+            s.push_str(&format!(".{}", v));
+        }
+        // Note: slang-test doesn't accept " syn" or "(api)" suffixes as input
+        s
+    }
+}
+
+impl TestId {
+    /// Convert to the timing cache key format: "path.variant"
+    /// This strips the synthesized flag and API suffix, keeping only the file path and variant.
+    /// Note: slang-test omits ".0" in output but includes it in dry-run, so we normalize
+    /// by treating no-variant source files as .0
+    pub fn to_timing_key(&self) -> String {
+        if let Some(v) = self.variant {
+            format!("{}.{}", self.path, v)
+        } else if self.path.ends_with(".slang")
+            || self.path.ends_with(".hlsl")
+            || self.path.ends_with(".glsl")
+            || self.path.ends_with(".c")
+        {
+            // slang-test omits .0 variant in output, normalize to .0
+            format!("{}.0", self.path)
+        } else {
+            self.path.clone()
+        }
+    }
 }
 
 impl std::fmt::Display for TestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_test_string())
     }
+}
+
+/// Convert a test string to its timing cache key.
+/// "tests/foo.slang.4 syn (vk)" -> "tests/foo.slang.4"
+pub fn test_to_timing_key(test: &str) -> String {
+    TestId::parse(test).to_timing_key()
 }
 
 impl PartialOrd for TestId {
@@ -221,10 +259,14 @@ pub fn get_state_dir() -> Option<PathBuf> {
 // Timing Cache
 // ============================================================================
 
+/// Timing cache stores per-test durations.
+/// Keys are test identifiers like "tests/foo.slang" or "tests/foo.slang.4" (with variant suffix).
+/// The variant suffix is included when there are multiple tests from the same file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TimingCache {
     pub version: u32,
-    pub timings: HashMap<String, HashMap<String, f64>>,
+    /// Map from test identifier (with optional variant suffix) to duration in seconds
+    pub timings: HashMap<String, f64>,
 }
 
 impl TimingCache {
@@ -232,13 +274,17 @@ impl TimingCache {
         if let Some(state_dir) = get_state_dir() {
             let path = state_dir.join("timing.json");
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(cache) = serde_json::from_str(&contents) {
-                    return cache;
+                // Try to parse as new format (version 2)
+                if let Ok(cache) = serde_json::from_str::<TimingCache>(&contents) {
+                    if cache.version >= 2 {
+                        return cache;
+                    }
                 }
+                // Old format or version 1 - just start fresh
             }
         }
         Self {
-            version: 1,
+            version: 2,
             timings: HashMap::new(),
         }
     }
@@ -253,9 +299,9 @@ impl TimingCache {
         }
     }
 
-    pub fn record(&mut self, file: &str, backend: &str, duration: f64) {
-        let file_entry = self.timings.entry(file.to_string()).or_default();
-        let existing = file_entry.entry(backend.to_string()).or_insert(0.0);
+    /// Record a test's duration. Uses EMA to smooth out variations.
+    pub fn record(&mut self, test_id: &str, duration: f64) {
+        let existing = self.timings.entry(test_id.to_string()).or_insert(0.0);
         if *existing == 0.0 {
             *existing = duration;
         } else {
@@ -263,41 +309,15 @@ impl TimingCache {
         }
     }
 
-    pub fn predict(&self, file: &str, api_filter: Option<&str>, include_startup: bool) -> f64 {
-        if let Some(backends) = self.timings.get(file) {
-            let base_time = match api_filter {
-                Some(api) => {
-                    backends.get(api).copied().unwrap_or(DEFAULT_PREDICTED_DURATION)
-                }
-                None => {
-                    if let Some(&total_time) = backends.get("_total") {
-                        total_time
-                    } else {
-                        let total: f64 = backends.iter()
-                            .filter(|(k, _)| *k != "_startup")
-                            .map(|(_, v)| *v)
-                            .sum();
-                        if total > 0.0 { total } else { DEFAULT_PREDICTED_DURATION }
-                    }
-                }
-            };
-
-            if include_startup {
-                let startup = backends.get("_startup").copied().unwrap_or(0.0);
-                base_time + startup
-            } else {
-                base_time
-            }
-        } else {
-            DEFAULT_PREDICTED_DURATION
-        }
+    /// Predict duration for a test. Returns DEFAULT_PREDICTED_DURATION if unknown.
+    pub fn predict(&self, test_id: &str) -> f64 {
+        self.timings.get(test_id).copied().unwrap_or(DEFAULT_PREDICTED_DURATION)
     }
 
-    pub fn merge(&mut self, observed: &HashMap<String, HashMap<String, f64>>) {
-        for (file, backends) in observed {
-            for (backend, duration) in backends {
-                self.record(file, backend, *duration);
-            }
+    /// Merge observed timings into the cache
+    pub fn merge(&mut self, observed: &HashMap<String, f64>) {
+        for (test_id, duration) in observed {
+            self.record(test_id, *duration);
         }
     }
 }
@@ -328,10 +348,10 @@ pub struct TestStats {
     pub ignored: AtomicUsize,
     pub retried_and_passed: AtomicUsize,
     pub files_seen: Mutex<HashSet<String>>,
-    pub file_durations: Mutex<HashMap<String, f64>>,
     pub last_test_output: Mutex<Option<Instant>>,
     pub compiling_since: Mutex<Option<Instant>>,
-    pub observed_timings: Mutex<HashMap<String, HashMap<String, f64>>>,
+    /// Observed timings keyed by test identifier (e.g., "tests/foo.slang.4")
+    pub observed_timings: Mutex<HashMap<String, f64>>,
 }
 
 impl TestStats {
@@ -339,22 +359,8 @@ impl TestStats {
         self.files_seen.lock().unwrap().insert(file.to_string());
     }
 
-    pub fn record_duration(&self, file: &str, duration: Duration) {
-        let secs = duration.as_secs_f64();
-        let mut durations = self.file_durations.lock().unwrap();
-        *durations.entry(file.to_string()).or_insert(0.0) += secs;
-    }
-
     pub fn files_completed(&self) -> usize {
         self.files_seen.lock().unwrap().len()
-    }
-
-    pub fn slowest_files(&self, n: usize) -> Vec<(String, f64)> {
-        let durations = self.file_durations.lock().unwrap();
-        let mut sorted: Vec<_> = durations.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        sorted.truncate(n);
-        sorted
     }
 
     pub fn set_compiling(&self, is_compiling: bool) {
@@ -380,17 +386,13 @@ impl TestStats {
         self.last_test_output.lock().unwrap().map(|t| t.elapsed().as_secs_f64())
     }
 
-    pub fn record_observed_timing(&self, file: &str, backend: &str, duration: f64) {
+    /// Record observed timing for a test identifier (e.g., "tests/foo.slang.4")
+    pub fn record_observed_timing(&self, test_id: &str, duration: f64) {
         let mut observed = self.observed_timings.lock().unwrap();
-        let file_entry = observed.entry(file.to_string()).or_default();
-        if backend == "_total" {
-            *file_entry.entry(backend.to_string()).or_insert(0.0) = duration;
-        } else {
-            file_entry.insert(backend.to_string(), duration);
-        }
+        observed.insert(test_id.to_string(), duration);
     }
 
-    pub fn get_observed_timings(&self) -> HashMap<String, HashMap<String, f64>> {
+    pub fn get_observed_timings(&self) -> HashMap<String, f64> {
         self.observed_timings.lock().unwrap().clone()
     }
 }
@@ -411,8 +413,8 @@ pub struct WorkPool {
     files: Mutex<Vec<String>>,
     max_batch_size: usize,
     num_workers: usize,
+    /// Predictions keyed by test identifier (e.g., "tests/foo.slang.4")
     pub predictions: HashMap<String, f64>,
-    pub startups: HashMap<String, f64>,
     pub total_predicted: f64,
     pub has_timing_data: bool,
     target_batch_duration: f64,
@@ -424,23 +426,17 @@ impl WorkPool {
         max_batch_size: usize,
         num_workers: usize,
         predictions: HashMap<String, f64>,
-        startups: HashMap<String, f64>,
         has_timing_data: bool,
         target_batch_duration: f64,
     ) -> Self {
         let total_predicted: f64 = files.iter()
-            .map(|f| {
-                let base = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                let startup = startups.get(f).copied().unwrap_or(0.0);
-                base + startup
-            })
+            .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
         Self {
             files: Mutex::new(files),
             max_batch_size,
             num_workers,
             predictions,
-            startups,
             total_predicted,
             has_timing_data,
             target_batch_duration,
@@ -450,11 +446,7 @@ impl WorkPool {
     pub fn predicted_remaining(&self) -> f64 {
         let files = self.files.lock().unwrap();
         files.iter()
-            .map(|f| {
-                let base = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                let startup = self.startups.get(f).copied().unwrap_or(0.0);
-                base + startup
-            })
+            .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum()
     }
 
@@ -764,29 +756,3 @@ pub fn get_load_average() -> Option<f64> {
     }
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-pub fn extract_backend(test_name: &str) -> Option<String> {
-    if let Some(start) = test_name.rfind('(') {
-        if let Some(end) = test_name.rfind(')') {
-            if start < end {
-                return Some(test_name[start + 1..end].to_string());
-            }
-        }
-    }
-    None
-}
-
-pub fn extract_api_filter(extra_args: &[String]) -> Option<String> {
-    let mut iter = extra_args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "-api" {
-            if let Some(api) = iter.next() {
-                return Some(api.clone());
-            }
-        }
-    }
-    None
-}
