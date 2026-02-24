@@ -11,6 +11,120 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+// ============================================================================
+// Test Identifier
+// ============================================================================
+
+/// Represents a test identifier from slang-test -dry-run
+/// Formats:
+/// - Simple: "tests/path/file.slang"
+/// - With variant: "tests/path/file.slang.0 (vk)"
+/// - Synthesized: "tests/path/file.slang.1 syn (llvm)"
+/// - Internal: "slang-unit-test-tool/modulePtr.internal"
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TestId {
+    /// Base file path (e.g., "tests/path/file.slang")
+    pub path: String,
+    /// Variant number if present (e.g., 0, 1, 2)
+    pub variant: Option<u32>,
+    /// Whether this is a synthesized test
+    pub synthesized: bool,
+    /// Backend/API if specified (e.g., "vk", "llvm", "cpu")
+    pub api: Option<String>,
+}
+
+impl TestId {
+    /// Parse a test identifier string from slang-test -dry-run output
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim();
+
+        // Extract API from parentheses at the end: "... (vk)"
+        let (rest, api) = if let Some(paren_start) = s.rfind('(') {
+            if let Some(paren_end) = s.rfind(')') {
+                if paren_end > paren_start {
+                    let api = s[paren_start + 1..paren_end].trim().to_string();
+                    let rest = s[..paren_start].trim();
+                    (rest, Some(api))
+                } else {
+                    (s, None)
+                }
+            } else {
+                (s, None)
+            }
+        } else {
+            (s, None)
+        };
+
+        // Check for "syn" suffix
+        let (rest, synthesized) = if rest.ends_with(" syn") {
+            (&rest[..rest.len() - 4], true)
+        } else {
+            (rest, false)
+        };
+
+        // Check for variant number: "path.slang.0" -> path="path.slang", variant=0
+        // Need to find the last ".N" where N is a number
+        let (path, variant) = if let Some(last_dot) = rest.rfind('.') {
+            let potential_num = &rest[last_dot + 1..];
+            if let Ok(num) = potential_num.parse::<u32>() {
+                // Make sure this isn't the file extension
+                let base = &rest[..last_dot];
+                if base.ends_with(".slang") || base.ends_with(".hlsl")
+                    || base.ends_with(".glsl") || base.ends_with(".c")
+                    || base.contains(".internal") {
+                    (base.to_string(), Some(num))
+                } else {
+                    (rest.to_string(), None)
+                }
+            } else {
+                (rest.to_string(), None)
+            }
+        } else {
+            (rest.to_string(), None)
+        };
+
+        TestId {
+            path,
+            variant,
+            synthesized,
+            api,
+        }
+    }
+
+    /// Convert back to the string format expected by slang-test
+    pub fn to_test_string(&self) -> String {
+        let mut s = self.path.clone();
+        if let Some(v) = self.variant {
+            s.push_str(&format!(".{}", v));
+        }
+        if self.synthesized {
+            s.push_str(" syn");
+        }
+        if let Some(ref api) = self.api {
+            s.push_str(&format!(" ({})", api));
+        }
+        s
+    }
+}
+
+impl std::fmt::Display for TestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_test_string())
+    }
+}
+
+impl PartialOrd for TestId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TestId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_test_string().cmp(&other.to_test_string())
+    }
+}
+
 // Constants
 pub const DEFAULT_PREDICTED_DURATION: f64 = 0.5;
 pub const EMA_NEW_WEIGHT: f64 = 0.7;
@@ -96,11 +210,11 @@ pub fn flush_event_log() {
 // State Directory
 // ============================================================================
 
-/// Get the state directory path (~/.local/state/slang-test-runner or XDG equivalent)
+/// Get the state directory path (~/.local/state/slang-test-interceptor or XDG equivalent)
 pub fn get_state_dir() -> Option<PathBuf> {
     dirs::state_dir()
         .or_else(|| dirs::data_local_dir()) // Fallback for macOS/Windows
-        .map(|p| p.join("slang-test-runner"))
+        .map(|p| p.join("slang-test-interceptor"))
 }
 
 // ============================================================================
@@ -294,7 +408,7 @@ pub struct FailureInfo {
 // ============================================================================
 
 pub struct WorkPool {
-    files: Mutex<Vec<PathBuf>>,
+    files: Mutex<Vec<String>>,
     max_batch_size: usize,
     num_workers: usize,
     pub predictions: HashMap<String, f64>,
@@ -306,7 +420,7 @@ pub struct WorkPool {
 
 impl WorkPool {
     pub fn new(
-        files: Vec<PathBuf>,
+        files: Vec<String>,
         max_batch_size: usize,
         num_workers: usize,
         predictions: HashMap<String, f64>,
@@ -316,9 +430,8 @@ impl WorkPool {
     ) -> Self {
         let total_predicted: f64 = files.iter()
             .map(|f| {
-                let key = f.to_string_lossy().to_string();
-                let base = predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                let startup = startups.get(&key).copied().unwrap_or(0.0);
+                let base = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let startup = startups.get(f).copied().unwrap_or(0.0);
                 base + startup
             })
             .sum();
@@ -338,15 +451,14 @@ impl WorkPool {
         let files = self.files.lock().unwrap();
         files.iter()
             .map(|f| {
-                let key = f.to_string_lossy().to_string();
-                let base = self.predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                let startup = self.startups.get(&key).copied().unwrap_or(0.0);
+                let base = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let startup = self.startups.get(f).copied().unwrap_or(0.0);
                 base + startup
             })
             .sum()
     }
 
-    pub fn add_file(&self, file: PathBuf) {
+    pub fn add_file(&self, file: String) {
         self.files.lock().unwrap().push(file);
     }
 
@@ -358,7 +470,7 @@ impl WorkPool {
         self.files.lock().unwrap().len()
     }
 
-    fn select_slow_biased_index(&self, files: &[PathBuf]) -> usize {
+    fn select_slow_biased_index(&self, files: &[String]) -> usize {
         if files.len() <= 2 {
             return 0;
         }
@@ -366,8 +478,7 @@ impl WorkPool {
         if self.has_timing_data {
             let mut indexed: Vec<(usize, f64)> = files.iter().enumerate()
                 .map(|(i, f)| {
-                    let key = f.to_string_lossy().to_string();
-                    let dur = self.predictions.get(&key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                    let dur = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
                     (i, dur)
                 })
                 .collect();
@@ -396,7 +507,7 @@ impl WorkPool {
         }
     }
 
-    pub fn try_get_batch(&self) -> Option<Vec<PathBuf>> {
+    pub fn try_get_batch(&self) -> Option<Vec<String>> {
         let mut files = self.files.lock().unwrap();
         if files.is_empty() {
             return None;
@@ -415,8 +526,7 @@ impl WorkPool {
             while !files.is_empty() {
                 let idx = self.select_slow_biased_index(&files);
                 let file = &files[idx];
-                let file_key = file.to_string_lossy().to_string();
-                let file_duration = self.predictions.get(&file_key).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                let file_duration = self.predictions.get(file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
 
                 if batch.is_empty() {
                     batch.push(files.swap_remove(idx));
@@ -448,7 +558,7 @@ impl WorkPool {
         }
     }
 
-    pub fn try_get_medium_batch(&self) -> Option<Vec<PathBuf>> {
+    pub fn try_get_medium_batch(&self) -> Option<Vec<String>> {
         let mut files = self.files.lock().unwrap();
         if files.is_empty() {
             return None;
@@ -569,7 +679,7 @@ impl ProgressDisplay {
 
 pub struct BatchContext<'a> {
     pub slang_test: &'a PathBuf,
-    pub test_files: &'a [PathBuf],
+    pub test_files: &'a [String],
     pub extra_args: &'a [String],
     pub timeout: Duration,
     pub stats: &'a TestStats,

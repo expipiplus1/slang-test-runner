@@ -1,0 +1,349 @@
+timestamp_ms,event,details
+0,start,jobs=32 batch_size=100 adaptive=false
+662,batch_start,ThreadId(8) files=24 pred=9.67s items=[tests/diagnostics/specialization-constants.slang(0.10s) tests/diagnostics/command-line/option-missing-argument.slang.1(0.50s) tests/diagnostics/array-of-unbounded-arrays.slang(0.01s) tests/diagnostics/sv-semantic-hull-domain.slang.0(0.50s) tests/diagnostics/int-literal-errors.slang(0.43s) tests/diagnostics/command-line/entry-point-conflicting-stage.slang.1(0.50s) tests/diagnostics/entry-point-mod-errors.slang.0(0.50s) tests/diagnostics/entry-point-main-warning.slang.2(0.50s) tests/diagnostics/for-loop-warning.slang(0.06s) tests/diagnostics/sv-semantic-type-validation.slang.0(0.50s) tests/diagnostics/while-predicate-type.slang(0.02s) tests/diagnostics/entry-point-main-warning.slang.1(0.50s) tests/diagnostics/sv-semantic-struct-invalid.slang(0.05s) tests/diagnostics/constexpr-param.slang.2(0.50s) tests/diagnostics/local-line.slang.4(0.50s) tests/diagnostics/overload-ambiguous.slang.0(0.50s) tests/diagnostics/illegal-func-decl.slang.1(0.50s) tests/diagnostics/image-format-unsupported-by-backend.slang.1(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.2(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.4(0.50s) tests/diagnostics/entry-point-mod-errors.slang.2(0.50s) tests/diagnostics/entry-point-mod-errors.slang.1(0.50s) tests/diagnostics/syntax-error-op-line.slang.4(0.50s) tests/diagnostics/tessellation-legalize-array-size-too-big.slang.0(0.50s)]
+668,batch_start,ThreadId(7) files=39 pred=9.52s items=[tests/diagnostics/uninitialized-existential.slang(0.03s) tests/diagnostics/command-line/profile-ignored.slang.1(0.50s) tests/diagnostics/image-format-unsupported-by-backend.slang.2(0.50s) tests/diagnostics/invalid-vector-element-count.slang(0.04s) tests/diagnostics/command-line/entry-point-redundant-stage.slang.1(0.50s) tests/diagnostics/sccp-div-by-zero.slang(0.09s) tests/diagnostics/invalid-constant-pointer-taking.slang(0.02s) tests/diagnostics/command-line/unknown-option.slang(0.06s) tests/diagnostics/nested-func.slang(0.06s) tests/diagnostics/local-line.slang.5(0.50s) tests/diagnostics/local-line.slang.1(0.50s) tests/diagnostics/missing-return-target.slang.2(0.50s) tests/diagnostics/missing-return-target.slang.4(0.50s) tests/diagnostics/force-no-diff-this.slang(0.06s) tests/diagnostics/uninitialized-fields-delegated.slang(0.00s) tests/diagnostics/missing-semicolon-after-semantic.slang(0.05s) tests/diagnostics/void-function-returning-value.slang(0.09s) tests/diagnostics/command-line/profile-ignored.slang.0(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.6(0.50s) tests/diagnostics/missing-return-target.slang.1(0.50s) tests/diagnostics/no-type-conformance.slang(0.08s) tests/diagnostics/metal-mesh-shader-output-ref.slang(0.00s) tests/diagnostics/uninitialized-local-variables.slang(0.02s) tests/diagnostics/array-parameterblock-array-in-struct.slang(0.04s) tests/diagnostics/extension-visibility.slang(0.07s) tests/diagnostics/uninitialized-out-parameters.slang(0.01s) tests/diagnostics/float-as-int-requires-constant.slang(0.03s) tests/diagnostics/constexpr-error.slang.1(0.50s) tests/diagnostics/syntax-error-intrinsic.slang.4(0.50s) tests/diagnostics/array-parameterblock-nested.slang(0.02s) tests/diagnostics/missing-return-target.slang.7(0.50s) tests/diagnostics/float-as-int-type-mismatch.slang(0.12s) tests/diagnostics/missing-return-target.slang.6(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.3(0.50s) tests/diagnostics/constexpr-param.slang.0(0.50s) tests/diagnostics/get-vertex-attribute.slang(0.10s) tests/diagnostics/break-outside-loop.slang.1(0.50s) tests/diagnostics/float-literal.slang(0.03s) tests/diagnostics/array-parameterblock-deeply-nested.slang(0.01s)]
+672,batch_start,ThreadId(9) files=35 pred=9.81s items=[tests/diagnostics/structuredbuffer-with-unbounded.slang(0.04s) tests/diagnostics/sv-semantic-geometry.slang.1(0.50s) tests/diagnostics/local-line.slang.3(0.50s) tests/diagnostics/recursion.slang(0.00s) tests/diagnostics/invalid-namespace-nesting.slang(0.01s) tests/diagnostics/unresolved-symbol.slang(0.00s) tests/diagnostics/sv-semantic-type-validation.slang.4(0.50s) tests/diagnostics/sv-semantic-type-validation.slang.5(0.50s) tests/diagnostics/syntax-error-op-line-3.slang.4(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.5(0.50s) tests/diagnostics/sv-semantic-inout.slang.0(0.50s) tests/diagnostics/illegal-func-decl.slang.4(0.50s) tests/diagnostics/missing-return.slang(0.06s) tests/diagnostics/local-line.slang.0(0.50s) tests/diagnostics/syntax-error-op-line-2.slang.0(0.50s) tests/diagnostics/autodiff-data-flow-2.slang(0.13s) tests/diagnostics/constexpr-error.slang.0(0.50s) tests/diagnostics/sv-semantic-geometry.slang.0(0.50s) tests/diagnostics/autodiff-data-flow-4.slang(0.08s) tests/diagnostics/syntax-error-op-line-2.slang.3(0.50s) tests/diagnostics/extension-unreferenced-generic-param.slang(0.02s) tests/diagnostics/x-macro-line-continuation.slang(0.02s) tests/diagnostics/uninitialized-struct-from-constructor.slang(0.06s) tests/diagnostics/matrix-swizzle.slang(0.03s) tests/diagnostics/methods/mutating-method-on-rvalue.slang(0.02s) tests/diagnostics/command-line/option-missing-argument.slang.0(0.50s) tests/diagnostics/token-paste-location.slang(0.03s) tests/diagnostics/param-mutation.slang(0.04s) tests/diagnostics/sv-semantic-wrong-direction.slang(0.11s) tests/diagnostics/inheritance-1.slang(0.11s) tests/diagnostics/already-has-a-body.slang(0.06s) tests/diagnostics/syntax-error-op-line-2.slang.2(0.50s) tests/diagnostics/syntax-error-op-line-2.slang.1(0.50s) tests/diagnostics/break-outside-loop.slang.0(0.50s) tests/diagnostics/uninitialized-resource-type.slang.1(0.50s)]
+677,batch_start,ThreadId(10) files=39 pred=9.85s items=[tests/diagnostics/sv-semantic-type-validation.slang.2(0.50s) tests/diagnostics/syntax-error-intrinsic.slang.0(0.50s) tests/diagnostics/command-line/entry-point-conflicting-stage.slang.0(0.50s) tests/diagnostics/illegal-func-decl.slang.3(0.50s) tests/diagnostics/register-bindings.slang(0.15s) tests/diagnostics/illegal-texel-type.slang(0.03s) tests/diagnostics/command-line/unknown-output-format.slang(0.06s) tests/diagnostics/syntax-error-intrinsic.slang.2(0.50s) tests/diagnostics/continue-outside-loop.slang(0.07s) tests/diagnostics/illegal-func-decl.slang.2(0.50s) tests/diagnostics/missing-return-target.slang.5(0.50s) tests/diagnostics/invalid-constraint.slang(0.04s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.0(0.50s) tests/diagnostics/setter-method.slang(0.00s) tests/diagnostics/overload-ambiguous.slang.1(0.50s) tests/diagnostics/mismatching-types.slang(0.07s) tests/diagnostics/end-of-input.slang(0.07s) tests/diagnostics/single-shader-record.slang(0.03s) tests/diagnostics/pragma-warning-multifile-main.slang(0.20s) tests/diagnostics/sv-semantic-hull-domain.slang.1(0.50s) tests/diagnostics/interfaces/interface-extension.slang(0.06s) tests/diagnostics/comma-operator-warning.slang(0.02s) tests/diagnostics/syntax-error-op-line-3.slang.2(0.50s) tests/diagnostics/interface-requirement-not-satisfied.slang(0.00s) tests/diagnostics/groupshared-local.slang(0.03s) tests/diagnostics/command-line/unknown-line-directive-mode.slang(0.07s) tests/diagnostics/entry-point-main-warning.slang.0(0.50s) tests/diagnostics/invalid-spv-obj.slang(0.01s) tests/diagnostics/interfaces/return-type-mismatch.slang(0.16s) tests/diagnostics/uninitialized-fields.slang(0.12s) tests/diagnostics/local-line.slang.2(0.50s) tests/diagnostics/unsized.slang(0.00s) tests/diagnostics/division-by-matrix.slang.0(0.50s) tests/diagnostics/syntax-error-op-line-3.slang.1(0.50s) tests/diagnostics/syntax-error-op-line-3.slang.0(0.50s) tests/diagnostics/sv-semantic-inout.slang.1(0.50s) tests/diagnostics/overlapping-bindings.slang(0.12s) tests/diagnostics/structuredbuffer-resource-static.slang(0.01s) tests/diagnostics/ambiguous-member-base/user.slang(0.04s)]
+682,batch_start,ThreadId(11) files=48 pred=9.75s items=[tests/diagnostics/syntax-error-intrinsic.slang.1(0.50s) tests/diagnostics/local-used-before-declared.slang(0.04s) tests/diagnostics/sv-semantic-type-validation.slang.3(0.50s) tests/diagnostics/bool-to-float.slang(0.01s) tests/diagnostics/resource-type-in-dynamic-dispatch.slang(0.12s) tests/diagnostics/autodiff-custom-diff-inout.slang(0.12s) tests/diagnostics/array-parameterblock-struct.slang(0.14s) tests/diagnostics/constexpr-param.slang.1(0.50s) tests/diagnostics/hlsl-to-vulkan-sampler-diagnostic.hlsl.1(0.50s) tests/diagnostics/comma-operator-warning-slang2026.slang(0.07s) tests/diagnostics/array-out-of-bounds-2.slang(0.07s) tests/diagnostics/concrete-argument-to-output-interface.slang(0.15s) tests/diagnostics/syntax-error-op-line.slang.0(0.50s) tests/diagnostics/command-line/entry-point-redundant-stage.slang.0(0.50s) tests/diagnostics/parameter-block-to-mutating-func.slang(0.05s) tests/diagnostics/uninitialized-resource-field.slang(0.11s) tests/diagnostics/warning_operator_left_shift_overflow.slang(0.01s) tests/diagnostics/lvalue-in-bwd-diff.slang(0.07s) tests/diagnostics/constant-buffer-unsized.slang(0.09s) tests/diagnostics/tessellation-legalize-array-size-too-big.slang.1(0.50s) tests/diagnostics/generic-type-inference-fail.slang(0.01s) tests/diagnostics/recursive-type.slang(0.03s) tests/diagnostics/uninitialized-resource-type.slang.0(0.50s) tests/diagnostics/sv-semantic-type-validation.slang.1(0.50s) tests/diagnostics/syntax-error-op-line.slang.2(0.50s) tests/diagnostics/syntax-error-op-line-2.slang.4(0.50s) tests/diagnostics/structuredbuffer-resource-struct-array.slang(0.01s) tests/diagnostics/glsl-global-const-with-init.slang(0.05s) tests/diagnostics/private-visibility.slang(0.03s) tests/diagnostics/command-line/output-no-entry-point.slang(0.02s) tests/diagnostics/inheritance-2.slang(0.09s) tests/diagnostics/missing-return-target.slang.3(0.50s) tests/diagnostics/no-subscript.slang(0.40s) tests/diagnostics/interfaces/anyvalue-size-validation.slang(0.02s) tests/diagnostics/int-texture-sample.slang(0.15s) tests/diagnostics/call-instance-from-static.slang(0.01s) tests/diagnostics/hlsl-to-vulkan-sampler-diagnostic.hlsl.0(0.50s) tests/diagnostics/static-ref-to-nonstatic-member.slang(0.02s) tests/diagnostics/missing-return-target.slang.0(0.50s) tests/diagnostics/structuredbuffer-resource-struct.slang(0.08s) tests/diagnostics/nested-pragma-main.slang(0.03s) tests/diagnostics/structuredbuffer-resource-struct-recursive.slang(0.05s) tests/diagnostics/entry-point-no-stage.slang(0.01s) tests/diagnostics/autodiff.slang(0.02s) tests/diagnostics/uninitialized-generic.slang(0.07s) tests/diagnostics/visibility.slang(0.06s) tests/diagnostics/diag-non-exhaustive-test.slang(0.10s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.1(0.50s)]
+686,batch_start,ThreadId(13) files=1 pred=0.00s items=[tests/diagnostics/wavesize-invalid-size.slang(0.00s)]
+686,batch_start,ThreadId(14) files=1 pred=0.00s items=[tests/diagnostics/nested-constant-buffer-in-parameter-block.slang(0.00s)]
+686,batch_start,ThreadId(15) files=1 pred=0.00s items=[tests/diagnostics/cuda-kernel-non-void-return.slang(0.00s)]
+686,batch_start,ThreadId(16) files=1 pred=0.00s items=[tests/diagnostics/generic-value-parameter-float-type.slang(0.00s)]
+686,batch_start,ThreadId(17) files=1 pred=0.00s items=[tests/diagnostics/const-to-nodiff-function-diagnostic-improvement.slang(0.00s)]
+686,batch_start,ThreadId(19) files=1 pred=0.01s items=[tests/diagnostics/discard-in-rt.slang(0.01s)]
+686,batch_start,ThreadId(20) files=1 pred=0.02s items=[tests/diagnostics/hlsl-to-vulkan-shift-diagnostic.hlsl(0.02s)]
+686,batch_start,ThreadId(18) files=1 pred=0.01s items=[tests/diagnostics/recursive-import.slang(0.01s)]
+686,batch_start,ThreadId(12) files=100 pred=7.58s items=[tests/diagnostics/rich-diag-test.slang(0.11s) tests/diagnostics/illegal-func-decl.slang.0(0.50s) tests/diagnostics/global-uniform.slang.0(0.50s) tests/diagnostics/internal-visibility/this-module.slang(0.02s) tests/diagnostics/generic-constraint-equality-right-hand-side.slang(0.02s) tests/diagnostics/generic-invalid-type-specialization.slang(0.03s) tests/diagnostics/const-to-nodiff-function-diagnostic-improvement1.slang(0.06s) tests/diagnostics/missing-include-file.slang(0.01s) tests/diagnostics/image-format-unsupported-by-backend.slang.0(0.50s) tests/diagnostics/undefined-in-preprocessor-conditional.slang(0.03s) tests/diagnostics/undefined-identifier.slang(0.04s) tests/diagnostics/syntax-error-op-line.slang.1(0.50s) tests/diagnostics/command-line/explicit-implicit-stage-mismatch.vert(0.00s) tests/diagnostics/extension-full-name.slang(0.01s) tests/diagnostics/global-uniform.slang.1(0.50s) tests/diagnostics/syntax-error-op-line-3.slang.3(0.50s) tests/diagnostics/syntax-error-op-line.slang.3(0.50s) tests/diagnostics/mesh-shader-invalid-output-topology.slang.7(0.50s) tests/diagnostics/command-line/unknown-profile.slang(0.11s) tests/diagnostics/missing-override.slang(0.01s) tests/diagnostics/bad-operator-call.slang(0.02s) tests/diagnostics/command-line/output-no-target.slang(0.04s) tests/diagnostics/command-line/stage-ignored.slang(0.17s) tests/diagnostics/interfaces/mutating-impl-of-non-mutating-req.slang(0.06s) tests/diagnostics/generic-constraint-forward-reference.slang(0.02s) tests/diagnostics/syntax-error-intrinsic.slang.3(0.50s) tests/diagnostics/non-standard-extension.slang(0.06s) tests/diagnostics/pragma-warning-single-file.slang(0.05s) tests/diagnostics/autodiff-data-flow.slang(0.05s) tests/diagnostics/unreachable-code.slang(0.03s) tests/diagnostics/transitive-namespace-import.slang/test.slang(0.03s) tests/diagnostics/local-used-in-own-declaration.slang(0.01s) tests/diagnostics/discard-in-compute.slang(0.01s) tests/diagnostics/command-line/unknown-source-language.slang(0.13s) tests/diagnostics/invalid-paq-stage-names.slang(0.00s) tests/diagnostics/interfaces/interface-override.slang(0.11s) tests/diagnostics/command-line/separate-debug-info-unsupported-glsl.slang(0.02s) tests/diagnostics/switch-multiple-defaults.slang(0.05s) tests/diagnostics/autodiff-data-flow-3.slang(0.02s) tests/diagnostics/division-by-matrix.slang.1(0.50s) tests/diagnostics/sv-semantic-mesh.slang(0.02s) tests/diagnostics/unrecognized-glsl-layout-modifiers.slang(0.02s) tests/diagnostics/uninitialized-globals.slang(0.02s) tests/diagnostics/token-line-continuation.slang(0.00s) tests/diagnostics/entry-point-stage-mismatch.slang(0.05s) tests/diagnostics/variable-void-type.slang(0.01s) tests/diagnostics/const-ref-differentiable-param.slang(0.07s) tests/diagnostics/array-neg-size.slang(0.04s) tests/diagnostics/gh-1374.slang(0.08s) tests/diagnostics/uninitialized-variable-name-in-error-message.slang(0.02s) tests/diagnostics/property-readonly-lvalue.slang(0.03s) tests/diagnostics/array-out-of-bounds.slang(0.02s) tests/diagnostics/nested-struct-with-unbounded.slang(0.01s) tests/diagnostics/vk-bindings.slang(0.02s) tests/diagnostics/sv-semantic-unknown.slang(0.02s) tests/diagnostics/array-of-struct-with-parameterblock.slang(0.01s) tests/diagnostics/generic-incorrect-default-arg.slang(0.01s) tests/diagnostics/structuredbuffer-resource-struct-recursive-mutual.slang(0.02s) tests/diagnostics/command-line/x-arg-tool-unknown.slang(0.01s) tests/diagnostics/generic-constraint-left-hand-side.slang(0.03s) tests/diagnostics/command-line/duplicate-output.slang(0.00s) tests/diagnostics/structured-buffer-parameterblock.slang(0.01s) tests/diagnostics/invalid-tuple.slang(0.01s) tests/diagnostics/unbound-loop.slang(0.01s) tests/diagnostics/single-target-intrinsic.slang(0.13s) tests/diagnostics/variable-redeclaration.slang(0.09s) tests/diagnostics/global-const-uniform-with-init.slang(0.01s) tests/diagnostics/cuda-kernel-differentiable-params.slang(0.01s) tests/diagnostics/sv-semantic-wrong-stage.slang(0.01s) tests/diagnostics/command-line/pass-through-no-stage.hlsl(0.02s) tests/diagnostics/vk-binding-with-register-no-warning.slang(0.01s) tests/diagnostics/deprecation.slang(0.03s) tests/diagnostics/int-literal.slang(0.02s) tests/diagnostics/assign-in-if.slang(0.02s) tests/diagnostics/generic-value-parameter-must-have-type.slang(0.00s) tests/diagnostics/command-line/unknown-pass-through-target.slang(0.06s) tests/diagnostics/enum-implicit-conversion.slang(0.00s) tests/diagnostics/extension-interface-requirement.slang(0.01s) tests/diagnostics/implicit-cast-lvalue.slang(0.02s) tests/diagnostics/if-empty-body.slang(0.01s) tests/diagnostics/command-line/unknown-stage.slang(0.01s) tests/diagnostics/accessors.slang(0.01s) tests/diagnostics/vk-offset.slang(0.02s) tests/diagnostics/ctor-ordinary-retval-legal.slang(0.00s) tests/diagnostics/size-of.slang(0.01s) tests/diagnostics/modifier-check.slang(0.00s) tests/diagnostics/autodiff-custom-diff-unresolved.slang(0.01s) tests/diagnostics/parameter-already-defined.slang(0.01s) tests/diagnostics/hlsl-global-const-with-init-still-errors.slang(0.01s) tests/diagnostics/uninitialized-use-functions.slang(0.01s) tests/diagnostics/arrow-operator.slang(0.01s) tests/diagnostics/array-parameterblock-direct.slang(0.01s) tests/diagnostics/custom-derivative-generic.slang(0.00s) tests/diagnostics/unbounded-array-nonaddressable.slang(0.03s) tests/diagnostics/static-ref-to-nonstatic-member-2.slang(0.00s) tests/diagnostics/expected-token.slang(0.01s) tests/diagnostics/illegal-character.slang(0.02s) tests/diagnostics/structuredbuffer-resource.slang(0.00s) tests/diagnostics/expected-token-eof.slang(0.02s) tests/diagnostics/autodiff-primal-substitute.slang(0.01s)]
+686,batch_start,ThreadId(29) files=1 pred=0.00s items=[tests/diagnostics/command-line/unknown-codegen-target.slang(0.00s)]
+686,batch_start,ThreadId(30) files=1 pred=0.01s items=[tests/diagnostics/command-line/duplicate-target.slang(0.01s)]
+686,batch_start,ThreadId(23) files=1 pred=0.00s items=[tests/diagnostics/array-of-struct-with-unbounded.slang(0.00s)]
+686,batch_start,ThreadId(32) files=1 pred=0.00s items=[tests/diagnostics/raypayload-missing-access-qualifiers.slang(0.00s)]
+686,batch_start,ThreadId(24) files=1 pred=0.00s items=[tests/diagnostics/command-line/separate-debug-info-unsupported-target.slang(0.00s)]
+686,batch_start,ThreadId(25) files=1 pred=0.01s items=[tests/diagnostics/invalid-buffer.slang(0.01s)]
+686,batch_start,ThreadId(35) files=1 pred=0.00s items=[tests/diagnostics/diag-block-comment-test.slang(0.00s)]
+686,batch_start,ThreadId(26) files=1 pred=0.00s items=[tests/diagnostics/wave-operations-types.slang(0.00s)]
+686,batch_start,ThreadId(27) files=1 pred=0.00s items=[tests/diagnostics/switch-duplicate-case.slang(0.00s)]
+686,batch_start,ThreadId(28) files=1 pred=0.00s items=[tests/diagnostics/subscript-missing-return-type.slang(0.00s)]
+686,batch_start,ThreadId(21) files=1 pred=0.00s items=[tests/diagnostics/ctor-noncopyable-retval-legal.slang(0.00s)]
+686,batch_start,ThreadId(22) files=1 pred=0.00s items=[tests/diagnostics/call-argument-type.slang(0.00s)]
+686,batch_start,ThreadId(31) files=1 pred=0.03s items=[tests/diagnostics/dangling-comparison.slang(0.03s)]
+686,batch_start,ThreadId(33) files=1 pred=0.01s items=[tests/diagnostics/attribute-error.slang(0.01s)]
+686,batch_start,ThreadId(34) files=1 pred=0.01s items=[tests/diagnostics/gh-38-vs.hlsl(0.01s)]
+1134,test,ThreadId(18) passed tests/diagnostics/recursive-import.slang duration_ms=57
+1154,batch_end,ThreadId(18) total_ms=468 test_sum_ms=57 overhead_ms=411 pred_ms=7 tests=1
+1158,test,ThreadId(15) passed tests/diagnostics/cuda-kernel-non-void-return.slang duration_ms=50
+1164,test,ThreadId(30) passed tests/diagnostics/command-line/duplicate-target.slang duration_ms=52
+1165,test,ThreadId(29) passed tests/diagnostics/command-line/unknown-codegen-target.slang duration_ms=49
+1168,test,ThreadId(28) passed tests/diagnostics/subscript-missing-return-type.slang duration_ms=51
+1168,test,ThreadId(22) passed tests/diagnostics/call-argument-type.slang duration_ms=54
+1172,batch_end,ThreadId(15) total_ms=485 test_sum_ms=50 overhead_ms=435 pred_ms=1 tests=1
+1172,test,ThreadId(25) passed tests/diagnostics/invalid-buffer.slang duration_ms=54
+1174,test,ThreadId(20) passed tests/diagnostics/hlsl-to-vulkan-shift-diagnostic.hlsl duration_ms=124
+1174,test,ThreadId(24) passed tests/diagnostics/command-line/separate-debug-info-unsupported-target.slang duration_ms=65
+1174,batch_end,ThreadId(30) total_ms=488 test_sum_ms=52 overhead_ms=436 pred_ms=5 tests=1
+1175,batch_end,ThreadId(29) total_ms=489 test_sum_ms=49 overhead_ms=440 pred_ms=2 tests=1
+1178,test,ThreadId(8) passed tests/diagnostics/specialization-constants.slang duration_ms=118
+1178,batch_end,ThreadId(28) total_ms=492 test_sum_ms=51 overhead_ms=441 pred_ms=0 tests=1
+1180,test,ThreadId(19) passed tests/diagnostics/discard-in-rt.slang duration_ms=68
+1181,test,ThreadId(27) passed tests/diagnostics/switch-duplicate-case.slang duration_ms=62
+1184,batch_end,ThreadId(24) total_ms=498 test_sum_ms=65 overhead_ms=433 pred_ms=4 tests=1
+1188,batch_end,ThreadId(20) total_ms=501 test_sum_ms=124 overhead_ms=377 pred_ms=18 tests=1
+1188,batch_end,ThreadId(25) total_ms=502 test_sum_ms=54 overhead_ms=448 pred_ms=5 tests=1
+1188,batch_end,ThreadId(22) total_ms=502 test_sum_ms=54 overhead_ms=448 pred_ms=2 tests=1
+1191,batch_end,ThreadId(27) total_ms=505 test_sum_ms=62 overhead_ms=443 pred_ms=3 tests=1
+1194,test,ThreadId(13) passed tests/diagnostics/wavesize-invalid-size.slang duration_ms=88
+1195,batch_end,ThreadId(19) total_ms=509 test_sum_ms=68 overhead_ms=441 pred_ms=8 tests=1
+1198,test,ThreadId(35) passed tests/diagnostics/diag-block-comment-test.slang duration_ms=84
+1201,test,ThreadId(9) passed tests/diagnostics/structuredbuffer-with-unbounded.slang duration_ms=235
+1209,test,ThreadId(33) passed tests/diagnostics/attribute-error.slang duration_ms=91
+1212,batch_end,ThreadId(35) total_ms=525 test_sum_ms=84 overhead_ms=441 pred_ms=1 tests=1
+1214,batch_end,ThreadId(13) total_ms=528 test_sum_ms=88 overhead_ms=440 pred_ms=3 tests=1
+1221,test,ThreadId(9) passed tests/diagnostics/recursion.slang duration_ms=16
+1221,test,ThreadId(9) passed tests/diagnostics/invalid-namespace-nesting.slang duration_ms=0
+1227,test,ThreadId(16) passed tests/diagnostics/generic-value-parameter-float-type.slang duration_ms=204
+1229,batch_end,ThreadId(33) total_ms=542 test_sum_ms=91 overhead_ms=451 pred_ms=11 tests=1
+1240,batch_end,ThreadId(16) total_ms=554 test_sum_ms=204 overhead_ms=350 pred_ms=1 tests=1
+1241,test,ThreadId(23) passed tests/diagnostics/array-of-struct-with-unbounded.slang duration_ms=131
+1249,test,ThreadId(8) passed tests/diagnostics/array-of-unbounded-arrays.slang duration_ms=71
+1251,test,ThreadId(34) passed tests/diagnostics/gh-38-vs.hlsl duration_ms=133
+1255,test,ThreadId(10) passed tests/diagnostics/register-bindings.slang duration_ms=180
+1259,test,ThreadId(8) passed tests/diagnostics/int-literal-errors.slang duration_ms=9
+1261,test,ThreadId(26) passed tests/diagnostics/wave-operations-types.slang duration_ms=138
+1261,batch_end,ThreadId(34) total_ms=575 test_sum_ms=133 overhead_ms=442 pred_ms=10 tests=1
+1261,batch_end,ThreadId(23) total_ms=575 test_sum_ms=131 overhead_ms=444 pred_ms=2 tests=1
+1270,test,ThreadId(7) passed tests/diagnostics/uninitialized-existential.slang duration_ms=176
+1271,test,ThreadId(14) passed tests/diagnostics/nested-constant-buffer-in-parameter-block.slang duration_ms=156
+1271,batch_end,ThreadId(26) total_ms=585 test_sum_ms=138 overhead_ms=447 pred_ms=4 tests=1
+1275,test,ThreadId(10) passed tests/diagnostics/illegal-texel-type.slang duration_ms=14
+1275,test,ThreadId(10) passed tests/diagnostics/command-line/unknown-output-format.slang duration_ms=0
+1275,test,ThreadId(10) passed tests/diagnostics/continue-outside-loop.slang duration_ms=0
+1275,test,ThreadId(10) passed tests/diagnostics/invalid-constraint.slang duration_ms=3
+1281,batch_end,ThreadId(14) total_ms=595 test_sum_ms=156 overhead_ms=439 pred_ms=3 tests=1
+1284,test,ThreadId(17) passed tests/diagnostics/const-to-nodiff-function-diagnostic-improvement.slang duration_ms=261
+1285,test,ThreadId(10) passed tests/diagnostics/setter-method.slang duration_ms=12
+1290,test,ThreadId(31) passed tests/diagnostics/dangling-comparison.slang duration_ms=171
+1292,test,ThreadId(9) passed tests/diagnostics/unresolved-symbol.slang duration_ms=78
+1292,test,ThreadId(21) passed tests/diagnostics/ctor-noncopyable-retval-legal.slang duration_ms=179
+1299,batch_end,ThreadId(17) total_ms=613 test_sum_ms=261 overhead_ms=352 pred_ms=3 tests=1
+1303,batch_end,ThreadId(31) total_ms=617 test_sum_ms=171 overhead_ms=446 pred_ms=28 tests=1
+1313,batch_end,ThreadId(21) total_ms=626 test_sum_ms=179 overhead_ms=447 pred_ms=2 tests=1
+1315,test,ThreadId(10) passed tests/diagnostics/mismatching-types.slang duration_ms=22
+1315,test,ThreadId(10) passed tests/diagnostics/end-of-input.slang duration_ms=0
+1319,test,ThreadId(11) passed tests/diagnostics/local-used-before-declared.slang duration_ms=218
+1324,test,ThreadId(32) passed tests/diagnostics/raypayload-missing-access-qualifiers.slang duration_ms=214
+1330,test,ThreadId(11) passed tests/diagnostics/bool-to-float.slang duration_ms=2
+1344,batch_end,ThreadId(32) total_ms=657 test_sum_ms=214 overhead_ms=443 pred_ms=1 tests=1
+1360,test,ThreadId(7) passed tests/diagnostics/invalid-vector-element-count.slang duration_ms=93
+1380,test,ThreadId(11) passed tests/diagnostics/resource-type-in-dynamic-dispatch.slang duration_ms=54
+1392,test,ThreadId(9) passed tests/diagnostics/missing-return.slang duration_ms=98
+1450,test,ThreadId(11) passed tests/diagnostics/autodiff-custom-diff-inout.slang duration_ms=72
+1456,test,ThreadId(10) passed tests/diagnostics/single-shader-record.slang duration_ms=139
+1476,test,ThreadId(10) passed tests/diagnostics/pragma-warning-multifile-main.slang duration_ms=24
+1476,test,ThreadId(10) passed tests/diagnostics/interfaces/interface-extension.slang duration_ms=0
+1491,test,ThreadId(7) passed tests/diagnostics/sccp-div-by-zero.slang duration_ms=131
+1500,test,ThreadId(8) passed tests/diagnostics/for-loop-warning.slang duration_ms=242
+1500,test,ThreadId(8) passed tests/diagnostics/while-predicate-type.slang duration_ms=1
+1506,test,ThreadId(12) passed tests/diagnostics/rich-diag-test.slang duration_ms=396
+1521,test,ThreadId(8) passed tests/diagnostics/sv-semantic-struct-invalid.slang duration_ms=17
+1521,test,ThreadId(8) passed tests/diagnostics/command-line/entry-point-conflicting-stage.slang.1 duration_ms=1
+1521,test,ThreadId(8) passed tests/diagnostics/command-line/option-missing-argument.slang.1 duration_ms=0
+1537,test,ThreadId(12) passed tests/diagnostics/internal-visibility/this-module.slang duration_ms=23
+1537,test,ThreadId(12) passed tests/diagnostics/generic-constraint-equality-right-hand-side.slang duration_ms=3
+1541,test,ThreadId(11) passed tests/diagnostics/array-parameterblock-struct.slang duration_ms=88
+1541,test,ThreadId(7) passed tests/diagnostics/invalid-constant-pointer-taking.slang duration_ms=51
+1541,test,ThreadId(7) passed tests/diagnostics/command-line/unknown-option.slang duration_ms=0
+1551,test,ThreadId(7) passed tests/diagnostics/nested-func.slang duration_ms=8
+1564,test,ThreadId(9) passed tests/diagnostics/autodiff-data-flow-2.slang duration_ms=173
+1601,test,ThreadId(11) passed tests/diagnostics/comma-operator-warning-slang2026.slang duration_ms=60
+1607,test,ThreadId(12) passed tests/diagnostics/generic-invalid-type-specialization.slang duration_ms=70
+1617,test,ThreadId(10) passed tests/diagnostics/comma-operator-warning.slang duration_ms=135
+1617,test,ThreadId(10) passed tests/diagnostics/interface-requirement-not-satisfied.slang duration_ms=0
+1617,test,ThreadId(10) passed tests/diagnostics/groupshared-local.slang duration_ms=1
+1617,test,ThreadId(10) passed tests/diagnostics/command-line/unknown-line-directive-mode.slang duration_ms=0
+1617,test,ThreadId(10) passed tests/diagnostics/invalid-spv-obj.slang duration_ms=0
+1619,stats,load_1m=0.75 load_5m=1.27 cpu_avg=62.1% gpu=13% running=6 adaptive=0 pool=0
+1628,test,ThreadId(10) passed tests/diagnostics/interfaces/return-type-mismatch.slang duration_ms=9
+1644,test,ThreadId(9) passed tests/diagnostics/autodiff-data-flow-4.slang duration_ms=74
+1644,test,ThreadId(9) passed tests/diagnostics/extension-unreferenced-generic-param.slang duration_ms=6
+1644,test,ThreadId(9) passed tests/diagnostics/x-macro-line-continuation.slang duration_ms=0
+1662,test,ThreadId(8) passed tests/diagnostics/constexpr-param.slang.2 duration_ms=138
+1685,test,ThreadId(9) passed tests/diagnostics/uninitialized-struct-from-constructor.slang duration_ms=34
+1692,test,ThreadId(7) passed tests/diagnostics/force-no-diff-this.slang duration_ms=133
+1695,test,ThreadId(9) passed tests/diagnostics/matrix-swizzle.slang duration_ms=11
+1712,test,ThreadId(11) passed tests/diagnostics/array-out-of-bounds-2.slang duration_ms=111
+1715,test,ThreadId(9) passed tests/diagnostics/methods/mutating-method-on-rvalue.slang duration_ms=15
+1715,test,ThreadId(9) passed tests/diagnostics/token-paste-location.slang duration_ms=0
+1722,test,ThreadId(11) passed tests/diagnostics/concrete-argument-to-output-interface.slang duration_ms=4
+1752,test,ThreadId(8) passed tests/diagnostics/entry-point-main-warning.slang.1 duration_ms=90
+1758,test,ThreadId(12) passed tests/diagnostics/const-to-nodiff-function-diagnostic-improvement1.slang duration_ms=146
+1758,test,ThreadId(12) passed tests/diagnostics/missing-include-file.slang duration_ms=0
+1758,test,ThreadId(12) passed tests/diagnostics/undefined-in-preprocessor-conditional.slang duration_ms=0
+1758,test,ThreadId(12) passed tests/diagnostics/undefined-identifier.slang duration_ms=0
+1768,test,ThreadId(10) passed tests/diagnostics/uninitialized-fields.slang duration_ms=143
+1775,test,ThreadId(9) passed tests/diagnostics/param-mutation.slang duration_ms=67
+1779,test,ThreadId(10) passed tests/diagnostics/unsized.slang duration_ms=10
+1783,test,ThreadId(7) passed tests/diagnostics/uninitialized-fields-delegated.slang duration_ms=90
+1783,test,ThreadId(7) passed tests/diagnostics/missing-semicolon-after-semantic.slang duration_ms=0
+1793,test,ThreadId(7) passed tests/diagnostics/void-function-returning-value.slang duration_ms=11
+1795,test,ThreadId(9) passed tests/diagnostics/sv-semantic-wrong-direction.slang duration_ms=13
+1795,test,ThreadId(9) passed tests/diagnostics/inheritance-1.slang duration_ms=1
+1795,test,ThreadId(9) passed tests/diagnostics/already-has-a-body.slang duration_ms=0
+1795,test,ThreadId(9) passed tests/diagnostics/break-outside-loop.slang duration_ms=2
+1795,test,ThreadId(9) passed tests/diagnostics/command-line/option-missing-argument.slang duration_ms=0
+1799,test,ThreadId(12) passed tests/diagnostics/command-line/explicit-implicit-stage-mismatch.vert duration_ms=37
+1809,test,ThreadId(10) passed tests/diagnostics/overlapping-bindings.slang duration_ms=26
+1809,test,ThreadId(10) passed tests/diagnostics/structuredbuffer-resource-static.slang duration_ms=0
+1809,test,ThreadId(10) passed tests/diagnostics/ambiguous-member-base/user.slang duration_ms=3
+1813,test,ThreadId(7) passed tests/diagnostics/no-type-conformance.slang duration_ms=24
+1819,test,ThreadId(10) passed tests/diagnostics/command-line/entry-point-conflicting-stage.slang duration_ms=2
+1843,test,ThreadId(8) passed tests/diagnostics/entry-point-main-warning.slang.2 duration_ms=96
+1873,test,ThreadId(11) passed tests/diagnostics/parameter-block-to-mutating-func.slang duration_ms=150
+1909,test,ThreadId(10) passed tests/diagnostics/division-by-matrix.slang duration_ms=100
+1924,test,ThreadId(7) passed tests/diagnostics/metal-mesh-shader-output-ref.slang duration_ms=111
+1933,test,ThreadId(8) passed tests/diagnostics/entry-point-mod-errors.slang duration_ms=92
+1936,test,ThreadId(9) passed tests/diagnostics/constexpr-error.slang duration_ms=138
+1943,test,ThreadId(11) passed tests/diagnostics/uninitialized-resource-field.slang duration_ms=80
+1967,test,ThreadId(9) passed tests/diagnostics/illegal-func-decl.slang.4 duration_ms=27
+1980,test,ThreadId(12) passed tests/diagnostics/extension-full-name.slang duration_ms=187
+1980,test,ThreadId(12) passed tests/diagnostics/command-line/unknown-profile.slang duration_ms=0
+1980,test,ThreadId(12) passed tests/diagnostics/missing-override.slang duration_ms=1
+1980,test,ThreadId(12) ignored tests/diagnostics/bad-operator-call.slang duration_ms=0
+1980,test,ThreadId(12) passed tests/diagnostics/command-line/output-no-target.slang duration_ms=0
+1980,test,ThreadId(12) passed tests/diagnostics/command-line/stage-ignored.slang duration_ms=0
+2000,test,ThreadId(10) passed tests/diagnostics/entry-point-main-warning.slang duration_ms=88
+2000,test,ThreadId(12) passed tests/diagnostics/interfaces/mutating-impl-of-non-mutating-req.slang duration_ms=16
+2000,test,ThreadId(12) passed tests/diagnostics/generic-constraint-forward-reference.slang duration_ms=1
+2000,test,ThreadId(12) passed tests/diagnostics/non-standard-extension.slang duration_ms=2
+2030,test,ThreadId(10) passed tests/diagnostics/illegal-func-decl.slang.2 duration_ms=28
+2030,test,ThreadId(12) passed tests/diagnostics/pragma-warning-single-file.slang duration_ms=25
+2034,test,ThreadId(8) passed tests/diagnostics/entry-point-mod-errors.slang.1 duration_ms=92
+2044,test,ThreadId(11) passed tests/diagnostics/warning_operator_left_shift_overflow.slang duration_ms=92
+2050,test,ThreadId(10) passed tests/diagnostics/illegal-func-decl.slang.3 duration_ms=19
+2050,test,ThreadId(10) ignored tests/diagnostics/local-line.slang.2 duration_ms=0
+2091,test,ThreadId(10) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang duration_ms=35
+2101,test,ThreadId(10) passed tests/diagnostics/missing-return-target.slang.5 duration_ms=12
+2111,test,ThreadId(10) passed tests/diagnostics/overload-ambiguous.slang.1 duration_ms=13
+2121,test,ThreadId(10) passed tests/diagnostics/sv-semantic-hull-domain.slang.1 duration_ms=12
+2125,test,ThreadId(8) passed tests/diagnostics/entry-point-mod-errors.slang.2 duration_ms=91
+2135,test,ThreadId(11) passed tests/diagnostics/lvalue-in-bwd-diff.slang duration_ms=89
+2135,test,ThreadId(8) passed tests/diagnostics/illegal-func-decl.slang.1 duration_ms=19
+2145,test,ThreadId(11) passed tests/diagnostics/constant-buffer-unsized.slang duration_ms=14
+2201,test,ThreadId(10) passed tests/diagnostics/sv-semantic-inout.slang.1 duration_ms=73
+2205,test,ThreadId(8) passed tests/diagnostics/image-format-unsupported-by-backend.slang.1 duration_ms=61
+2205,test,ThreadId(7) passed tests/diagnostics/uninitialized-local-variables.slang duration_ms=281
+2205,test,ThreadId(8) ignored tests/diagnostics/local-line.slang.4 duration_ms=0
+2215,test,ThreadId(11) passed tests/diagnostics/generic-type-inference-fail.slang duration_ms=74
+2221,test,ThreadId(10) passed tests/diagnostics/sv-semantic-type-validation.slang.2 duration_ms=26
+2222,test,ThreadId(12) passed tests/diagnostics/autodiff-data-flow.slang duration_ms=191
+2222,test,ThreadId(12) passed tests/diagnostics/unreachable-code.slang duration_ms=1
+2222,test,ThreadId(12) passed tests/diagnostics/transitive-namespace-import.slang/test.slang duration_ms=1
+2225,test,ThreadId(11) passed tests/diagnostics/recursive-type.slang duration_ms=5
+2236,test,ThreadId(8) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.2 duration_ms=35
+2242,test,ThreadId(12) passed tests/diagnostics/local-used-in-own-declaration.slang duration_ms=14
+2242,test,ThreadId(12) passed tests/diagnostics/discard-in-compute.slang duration_ms=1
+2242,test,ThreadId(12) passed tests/diagnostics/command-line/unknown-source-language.slang duration_ms=0
+2252,test,ThreadId(12) passed tests/diagnostics/invalid-paq-stage-names.slang duration_ms=12
+2252,test,ThreadId(12) passed tests/diagnostics/interfaces/interface-override.slang duration_ms=1
+2262,test,ThreadId(12) passed tests/diagnostics/command-line/separate-debug-info-unsupported-glsl.slang duration_ms=7
+2262,test,ThreadId(12) passed tests/diagnostics/switch-multiple-defaults.slang duration_ms=0
+2266,test,ThreadId(7) passed tests/diagnostics/array-parameterblock-array-in-struct.slang duration_ms=59
+2276,test,ThreadId(8) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.4 duration_ms=34
+2276,test,ThreadId(7) passed tests/diagnostics/extension-visibility.slang duration_ms=7
+2286,test,ThreadId(8) passed tests/diagnostics/overload-ambiguous.slang duration_ms=12
+2296,test,ThreadId(8) passed tests/diagnostics/sv-semantic-hull-domain.slang duration_ms=12
+2327,test,ThreadId(8) passed tests/diagnostics/sv-semantic-type-validation.slang duration_ms=26
+2327,test,ThreadId(8) ignored tests/diagnostics/syntax-error-op-line.slang.4 duration_ms=0
+2343,test,ThreadId(12) passed tests/diagnostics/autodiff-data-flow-3.slang duration_ms=83
+2366,test,ThreadId(11) passed tests/diagnostics/structuredbuffer-resource-struct-array.slang duration_ms=143
+2373,test,ThreadId(12) passed tests/diagnostics/sv-semantic-mesh.slang duration_ms=22
+2377,test,ThreadId(8) passed tests/diagnostics/tessellation-legalize-array-size-too-big.slang duration_ms=48
+2393,batch_end,ThreadId(8) total_ms=1731 test_sum_ms=1305 overhead_ms=426 pred_ms=9665 tests=24
+2426,test,ThreadId(11) passed tests/diagnostics/glsl-global-const-with-init.slang duration_ms=61
+2427,test,ThreadId(7) passed tests/diagnostics/uninitialized-out-parameters.slang duration_ms=155
+2447,test,ThreadId(7) passed tests/diagnostics/float-as-int-requires-constant.slang duration_ms=13
+2483,test,ThreadId(12) passed tests/diagnostics/unrecognized-glsl-layout-modifiers.slang duration_ms=120
+2487,test,ThreadId(11) passed tests/diagnostics/private-visibility.slang duration_ms=61
+2487,test,ThreadId(11) passed tests/diagnostics/command-line/output-no-entry-point.slang duration_ms=0
+2487,test,ThreadId(11) passed tests/diagnostics/inheritance-2.slang duration_ms=0
+2513,test,ThreadId(10) passed tests/diagnostics/syntax-error-intrinsic.slang duration_ms=288
+2513,test,ThreadId(10) ignored tests/diagnostics/syntax-error-intrinsic.slang.2 duration_ms=0
+2524,test,ThreadId(12) passed tests/diagnostics/uninitialized-globals.slang duration_ms=37
+2524,test,ThreadId(12) passed tests/diagnostics/token-line-continuation.slang duration_ms=0
+2524,test,ThreadId(12) passed tests/diagnostics/entry-point-stage-mismatch.slang duration_ms=1
+2524,test,ThreadId(12) passed tests/diagnostics/variable-void-type.slang duration_ms=0
+2538,test,ThreadId(7) passed tests/diagnostics/array-parameterblock-nested.slang duration_ms=92
+2544,test,ThreadId(12) passed tests/diagnostics/const-ref-differentiable-param.slang duration_ms=14
+2548,test,ThreadId(7) passed tests/diagnostics/float-as-int-type-mismatch.slang duration_ms=11
+2554,test,ThreadId(12) passed tests/diagnostics/array-neg-size.slang duration_ms=11
+2558,test,ThreadId(7) passed tests/diagnostics/get-vertex-attribute.slang duration_ms=15
+2563,test,ThreadId(10) passed tests/diagnostics/syntax-error-op-line-3.slang duration_ms=47
+2563,test,ThreadId(10) ignored tests/diagnostics/syntax-error-op-line-3.slang.1 duration_ms=0
+2563,test,ThreadId(10) ignored tests/diagnostics/syntax-error-op-line-3.slang.2 duration_ms=0
+2595,batch_end,ThreadId(10) total_ms=1918 test_sum_ms=1464 overhead_ms=454 pred_ms=9850 tests=39
+2601,test,ThreadId(9) passed tests/diagnostics/local-line.slang duration_ms=638
+2634,test,ThreadId(12) passed tests/diagnostics/gh-1374.slang duration_ms=79
+2638,test,ThreadId(7) passed tests/diagnostics/float-literal.slang duration_ms=79
+2648,stats,load_1m=0.75 load_5m=1.27 cpu_avg=21.2% gpu=12% running=4 adaptive=0 pool=0
+2659,test,ThreadId(7) passed tests/diagnostics/array-parameterblock-deeply-nested.slang duration_ms=12
+2725,test,ThreadId(12) passed tests/diagnostics/uninitialized-variable-name-in-error-message.slang duration_ms=90
+2735,test,ThreadId(12) passed tests/diagnostics/property-readonly-lvalue.slang duration_ms=15
+2765,test,ThreadId(12) passed tests/diagnostics/array-out-of-bounds.slang duration_ms=26
+2775,test,ThreadId(12) passed tests/diagnostics/nested-struct-with-unbounded.slang duration_ms=11
+2816,test,ThreadId(12) passed tests/diagnostics/vk-bindings.slang duration_ms=36
+2826,test,ThreadId(12) passed tests/diagnostics/sv-semantic-unknown.slang duration_ms=11
+2826,test,ThreadId(12) passed tests/diagnostics/array-of-struct-with-parameterblock.slang duration_ms=5
+2906,test,ThreadId(12) passed tests/diagnostics/generic-incorrect-default-arg.slang duration_ms=78
+2910,test,ThreadId(7) passed tests/diagnostics/break-outside-loop.slang.1 duration_ms=256
+2910,test,ThreadId(7) passed tests/diagnostics/command-line/entry-point-redundant-stage.slang.1 duration_ms=0
+2910,test,ThreadId(7) passed tests/diagnostics/command-line/profile-ignored.slang duration_ms=0
+2910,test,ThreadId(7) passed tests/diagnostics/command-line/profile-ignored.slang.1 duration_ms=0
+2937,test,ThreadId(12) passed tests/diagnostics/structuredbuffer-resource-struct-recursive-mutual.slang duration_ms=27
+2937,test,ThreadId(12) passed tests/diagnostics/command-line/x-arg-tool-unknown.slang duration_ms=0
+2937,test,ThreadId(12) passed tests/diagnostics/generic-constraint-left-hand-side.slang duration_ms=0
+2937,test,ThreadId(12) passed tests/diagnostics/command-line/duplicate-output.slang duration_ms=0
+2957,test,ThreadId(12) passed tests/diagnostics/structured-buffer-parameterblock.slang duration_ms=23
+2967,test,ThreadId(12) passed tests/diagnostics/invalid-tuple.slang duration_ms=1
+3041,test,ThreadId(7) passed tests/diagnostics/constexpr-error.slang.1 duration_ms=131
+3084,test,ThreadId(9) passed tests/diagnostics/local-line.slang.3 duration_ms=483
+3101,batch_end,ThreadId(11) total_ms=2419 test_sum_ms=1378 overhead_ms=1041 pred_ms=9753 tests=20
+3124,test,ThreadId(9) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.5 duration_ms=41
+3148,test,ThreadId(12) passed tests/diagnostics/unbound-loop.slang duration_ms=190
+3148,test,ThreadId(12) ignored tests/diagnostics/single-target-intrinsic.slang duration_ms=0
+3168,test,ThreadId(12) passed tests/diagnostics/variable-redeclaration.slang duration_ms=14
+3172,test,ThreadId(7) passed tests/diagnostics/constexpr-param.slang duration_ms=130
+3178,test,ThreadId(12) passed tests/diagnostics/global-const-uniform-with-init.slang duration_ms=12
+3178,test,ThreadId(12) passed tests/diagnostics/cuda-kernel-differentiable-params.slang duration_ms=2
+3188,test,ThreadId(12) passed tests/diagnostics/sv-semantic-wrong-stage.slang duration_ms=11
+3198,test,ThreadId(12) passed tests/diagnostics/command-line/pass-through-no-stage.hlsl duration_ms=0
+3204,test,ThreadId(9) passed tests/diagnostics/sv-semantic-geometry.slang duration_ms=72
+3239,test,ThreadId(12) passed tests/diagnostics/vk-binding-with-register-no-warning.slang duration_ms=43
+3242,test,ThreadId(7) passed tests/diagnostics/image-format-unsupported-by-backend.slang.2 duration_ms=68
+3242,test,ThreadId(7) ignored tests/diagnostics/local-line.slang.1 duration_ms=0
+3249,test,ThreadId(12) passed tests/diagnostics/deprecation.slang duration_ms=10
+3275,test,ThreadId(9) passed tests/diagnostics/sv-semantic-geometry.slang.1 duration_ms=70
+3329,test,ThreadId(12) passed tests/diagnostics/int-literal.slang duration_ms=82
+3335,test,ThreadId(9) passed tests/diagnostics/sv-semantic-inout.slang duration_ms=61
+3349,test,ThreadId(12) passed tests/diagnostics/assign-in-if.slang duration_ms=16
+3349,test,ThreadId(12) passed tests/diagnostics/generic-value-parameter-must-have-type.slang duration_ms=2
+3349,test,ThreadId(12) passed tests/diagnostics/command-line/unknown-pass-through-target.slang duration_ms=0
+3365,test,ThreadId(9) passed tests/diagnostics/sv-semantic-type-validation.slang.4 duration_ms=28
+3396,test,ThreadId(9) passed tests/diagnostics/sv-semantic-type-validation.slang.5 duration_ms=33
+3446,test,ThreadId(9) passed tests/diagnostics/syntax-error-op-line-2.slang duration_ms=47
+3446,test,ThreadId(9) ignored tests/diagnostics/syntax-error-op-line-2.slang.1 duration_ms=0
+3446,test,ThreadId(9) ignored tests/diagnostics/syntax-error-op-line-2.slang.2 duration_ms=0
+3480,test,ThreadId(12) passed tests/diagnostics/enum-implicit-conversion.slang duration_ms=125
+3591,test,ThreadId(12) passed tests/diagnostics/extension-interface-requirement.slang duration_ms=111
+3591,test,ThreadId(12) passed tests/diagnostics/implicit-cast-lvalue.slang duration_ms=4
+3591,test,ThreadId(12) ignored tests/diagnostics/if-empty-body.slang duration_ms=0
+3591,test,ThreadId(12) passed tests/diagnostics/command-line/unknown-stage.slang duration_ms=0
+3621,test,ThreadId(12) passed tests/diagnostics/vk-offset.slang duration_ms=28
+3637,test,ThreadId(9) passed tests/diagnostics/syntax-error-op-line-2.slang.3 duration_ms=192
+3637,test,ThreadId(9) ignored tests/diagnostics/syntax-error-op-line-3.slang.4 duration_ms=0
+3676,stats,load_1m=0.75 load_5m=1.27 cpu_avg=13.8% gpu=20% running=3 adaptive=0 pool=0
+3702,test,ThreadId(12) passed tests/diagnostics/ctor-ordinary-retval-legal.slang duration_ms=81
+3702,test,ThreadId(12) passed tests/diagnostics/size-of.slang duration_ms=0
+3708,test,ThreadId(9) passed tests/diagnostics/uninitialized-resource-type.slang.1 duration_ms=69
+3712,test,ThreadId(12) passed tests/diagnostics/modifier-check.slang duration_ms=11
+3744,batch_end,ThreadId(9) total_ms=3071 test_sum_ms=2722 overhead_ms=349 pred_ms=9812 tests=35
+3772,test,ThreadId(12) passed tests/diagnostics/autodiff-custom-diff-unresolved.slang duration_ms=59
+3772,test,ThreadId(12) passed tests/diagnostics/parameter-already-defined.slang duration_ms=0
+3782,test,ThreadId(12) passed tests/diagnostics/hlsl-global-const-with-init-still-errors.slang duration_ms=12
+3823,test,ThreadId(12) passed tests/diagnostics/uninitialized-use-functions.slang duration_ms=34
+3823,test,ThreadId(12) passed tests/diagnostics/arrow-operator.slang duration_ms=3
+3833,test,ThreadId(12) passed tests/diagnostics/array-parameterblock-direct.slang duration_ms=10
+3856,test,ThreadId(7) passed tests/diagnostics/local-line.slang.5 duration_ms=609
+3886,test,ThreadId(7) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.3 duration_ms=35
+3933,test,ThreadId(12) passed tests/diagnostics/custom-derivative-generic.slang duration_ms=94
+3936,test,ThreadId(7) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.6 duration_ms=47
+3943,test,ThreadId(12) passed tests/diagnostics/unbounded-array-nonaddressable.slang duration_ms=12
+3943,test,ThreadId(12) passed tests/diagnostics/static-ref-to-nonstatic-member-2.slang duration_ms=2
+3943,test,ThreadId(12) passed tests/diagnostics/expected-token.slang duration_ms=0
+3943,test,ThreadId(12) passed tests/diagnostics/illegal-character.slang duration_ms=0
+3946,test,ThreadId(7) passed tests/diagnostics/missing-return-target.slang.1 duration_ms=11
+3956,test,ThreadId(7) passed tests/diagnostics/missing-return-target.slang.2 duration_ms=9
+3966,test,ThreadId(7) passed tests/diagnostics/missing-return-target.slang.4 duration_ms=11
+3977,test,ThreadId(7) passed tests/diagnostics/missing-return-target.slang.6 duration_ms=12
+3997,test,ThreadId(7) passed tests/diagnostics/missing-return-target.slang.7 duration_ms=12
+3997,test,ThreadId(7) ignored tests/diagnostics/syntax-error-intrinsic.slang.4 duration_ms=0
+4043,batch_end,ThreadId(7) total_ms=3375 test_sum_ms=2883 overhead_ms=492 pred_ms=9515 tests=39
+4094,test,ThreadId(12) passed tests/diagnostics/structuredbuffer-resource.slang duration_ms=152
+4094,test,ThreadId(12) passed tests/diagnostics/expected-token-eof.slang duration_ms=0
+4165,test,ThreadId(12) passed tests/diagnostics/autodiff-primal-substitute.slang duration_ms=70
+4276,test,ThreadId(12) passed tests/diagnostics/division-by-matrix.slang.1 duration_ms=104
+4296,test,ThreadId(12) passed tests/diagnostics/global-uniform.slang duration_ms=26
+4598,test,ThreadId(12) passed tests/diagnostics/global-uniform.slang.1 duration_ms=294
+4688,test,ThreadId(12) passed tests/diagnostics/illegal-func-decl.slang duration_ms=89
+4703,stats,load_1m=0.77 load_5m=1.27 cpu_avg=8.8% gpu=27% running=1 adaptive=0 pool=0
+4749,test,ThreadId(12) passed tests/diagnostics/image-format-unsupported-by-backend.slang duration_ms=62
+4789,test,ThreadId(12) passed tests/diagnostics/mesh-shader-invalid-output-topology.slang.7 duration_ms=39
+4950,test,ThreadId(12) passed tests/diagnostics/syntax-error-intrinsic.slang.3 duration_ms=162
+5151,test,ThreadId(12) passed tests/diagnostics/syntax-error-op-line-3.slang.3 duration_ms=202
+5151,test,ThreadId(12) ignored tests/diagnostics/syntax-error-op-line.slang.1 duration_ms=0
+5402,test,ThreadId(12) passed tests/diagnostics/syntax-error-op-line.slang.3 duration_ms=252
+5422,test,ThreadId(12) failed tests/diagnostics/accessors.slang duration_ms=0
+5423,batch_start,ThreadId(28) files=1 pred=0.01s items=[tests/diagnostics/accessors.slang(0.01s)]
+5439,batch_end,ThreadId(12) total_ms=4753 test_sum_ms=4245 overhead_ms=508 pred_ms=7578 tests=100
+5730,stats,load_1m=0.77 load_5m=1.27 cpu_avg=7.4% gpu=33% running=1 adaptive=0 pool=0
+5745,test,ThreadId(28) failed tests/diagnostics/accessors.slang duration_ms=0
+5749,batch_end,ThreadId(28) total_ms=325 test_sum_ms=0 overhead_ms=325 pred_ms=10 tests=1
+5848,end,success=false

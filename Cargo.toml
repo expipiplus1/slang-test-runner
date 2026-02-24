@@ -1,7 +1,11 @@
 [package]
-name = "slang-test-runner"
+name = "slang-test-interceptor"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "sti"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -10,7 +14,6 @@ rand = "0.8"
 csv = "1"
 sysinfo = "0.32"
 colored = "2"
-walkdir = "2"
 anyhow = "1"
 crossbeam-channel = "0.5"
 ctrlc = "3.4"

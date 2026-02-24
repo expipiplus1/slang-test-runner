@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::*;
+use crate::types::{*, TestId};
 
 // ============================================================================
 // Global Flags
@@ -18,6 +18,28 @@ use crate::types::*;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static COMPILING_CORE: AtomicBool = AtomicBool::new(false);
+
+// ============================================================================
+// Process Reaper - cleans up finished processes without blocking
+// ============================================================================
+
+static REAPER_TX: LazyLock<crossbeam_channel::Sender<std::process::Child>> = LazyLock::new(|| {
+    let (tx, rx) = crossbeam_channel::unbounded::<std::process::Child>();
+
+    thread::spawn(move || {
+        while let Ok(mut child) = rx.recv() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    });
+
+    tx
+});
+
+/// Send a child process to the reaper for cleanup
+pub fn reap_process(child: std::process::Child) {
+    let _ = REAPER_TX.send(child);
+}
 
 pub fn is_compiling_core() -> bool {
     COMPILING_CORE.load(Ordering::SeqCst)
@@ -33,6 +55,51 @@ pub fn is_interrupted() -> bool {
 
 pub fn set_interrupted() {
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Format exit status in a platform-appropriate way
+pub fn format_exit_status(status: Option<&std::process::ExitStatus>) -> String {
+    match status {
+        None => "unknown exit status".to_string(),
+        Some(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal() {
+                    let signal_name = match signal {
+                        6 => "SIGABRT",
+                        9 => "SIGKILL",
+                        11 => "SIGSEGV",
+                        15 => "SIGTERM",
+                        _ => "signal",
+                    };
+                    return format!("{} ({})", signal_name, signal);
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                if let Some(code) = status.code() {
+                    // Windows crash codes are in the 0xC0000000+ range
+                    if (code as u32) >= 0xC0000000 {
+                        let name = match code as u32 {
+                            0xC0000005 => "ACCESS_VIOLATION",
+                            0xC00000FD => "STACK_OVERFLOW",
+                            0xC0000409 => "STACK_BUFFER_OVERRUN",
+                            _ => "crash",
+                        };
+                        return format!("{} (0x{:08X})", name, code as u32);
+                    }
+                }
+            }
+
+            if let Some(code) = status.code() {
+                format!("exit code {}", code)
+            } else {
+                "terminated".to_string()
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -183,7 +250,8 @@ fn should_retry_test(
         if let Some(base_file) = extract_base_test_file(&outcome.name) {
             let file_path = PathBuf::from(&base_file);
             if file_path.exists() {
-                work_pool.add_file(file_path);
+                // Re-queue the test by its full name (with variant info if present)
+                work_pool.add_file(outcome.name.clone());
                 return true;
             }
         }
@@ -254,7 +322,7 @@ fn collect_failure_output(failed_outcomes: &mut [TestOutcome], stderr_lines: &[S
 
 pub fn run_batch_with_pool(
     slang_test: &PathBuf,
-    test_files: &[PathBuf],
+    test_files: &[String],
     extra_args: &[String],
     timeout: Duration,
     stats: &TestStats,
@@ -286,14 +354,12 @@ pub fn run_batch_with_pool(
     let batch_id = std::thread::current().id();
     let file_info: Vec<_> = ctx.test_files.iter()
         .map(|f| {
-            let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let key = f.to_string_lossy().to_string();
-            let pred = ctx.work_pool.predictions.get(&key).copied().unwrap_or(0.0);
-            format!("{}({:.2}s)", name, pred)
+            let pred = ctx.work_pool.predictions.get(f).copied().unwrap_or(0.0);
+            format!("{}({:.2}s)", f, pred)
         })
         .collect();
     let total_pred: f64 = ctx.test_files.iter()
-        .map(|f| ctx.work_pool.predictions.get(&f.to_string_lossy().to_string()).copied().unwrap_or(0.0))
+        .map(|f| ctx.work_pool.predictions.get(f).copied().unwrap_or(0.0))
         .sum();
     log_event("batch_start", &format!("{:?} files={} pred={:.2}s items=[{}]",
         batch_id, ctx.test_files.len(), total_pred, file_info.join(" ")));
@@ -334,7 +400,8 @@ pub fn run_batch_with_pool(
     }
 
     let mut cmd = Command::new(ctx.slang_test);
-    cmd.args(ctx.test_files)
+    cmd.arg("-explicit-test-order")
+        .args(ctx.test_files)
         .args(ctx.extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -353,6 +420,7 @@ pub fn run_batch_with_pool(
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
     let (stderr_tx, stderr_rx) = crossbeam_channel::unbounded::<String>();
     let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, String, f64)>();
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1); // Signal when output is complete
 
     let machine_output_for_stderr = ctx.machine_output;
     let num_files_in_batch = ctx.test_files.len();
@@ -361,6 +429,7 @@ pub fn run_batch_with_pool(
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut seen_tests: HashSet<String> = HashSet::new();
+        let mut saw_summary = false;
 
         let mut last_test_time: Option<Instant> = None;
         let mut current_file: Option<String> = None;
@@ -372,6 +441,14 @@ pub fn run_batch_with_pool(
                 break;
             }
             if let Ok(line) = line {
+                // Detect the summary line that indicates normal completion
+                if line.starts_with("===") || line.contains("% of tests") || line == "no tests run" {
+                    saw_summary = true;
+                    // Signal early that we're done - don't wait for process exit
+                    let _ = done_tx.try_send(true);
+                    continue;
+                }
+
                 if line.starts_with("Supported backends:")
                     || line.starts_with("Check ")
                     || line.starts_with("Retrying ")
@@ -440,7 +517,7 @@ pub fn run_batch_with_pool(
             }
         }
 
-        seen_tests
+        (seen_tests, saw_summary)
     });
 
     let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
@@ -467,6 +544,7 @@ pub fn run_batch_with_pool(
     let start = Instant::now();
     let mut this_batch_is_compiling = false;
     let mut killed_for_compilation = false;
+    let mut exit_status: Option<std::process::ExitStatus> = None;
 
     loop {
         if is_interrupted() {
@@ -511,8 +589,18 @@ pub fn run_batch_with_pool(
             process_outcome(outcome, &ctx, &mut failed_outcomes);
         }
 
+        // Check if output is complete (saw summary or "no tests run")
+        // Don't wait for process exit - send to reaper and continue immediately
+        if done_rx.try_recv().is_ok() {
+            reap_process(child);
+            break;
+        }
+
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
             Ok(None) => {
                 if start.elapsed() > ctx.timeout {
                     let _ = child.kill();
@@ -534,7 +622,7 @@ pub fn run_batch_with_pool(
         eprintln!("\nWARNING: Batch took {:.1}s", loop_time.as_secs_f64());
         eprintln!("  Reproduce: time {} {}{}",
             ctx.slang_test.display(),
-            ctx.test_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),
+            ctx.test_files.join(" "),
             extra_args_str
         );
     }
@@ -549,7 +637,7 @@ pub fn run_batch_with_pool(
 
     if killed_for_compilation {
         for file in ctx.test_files {
-            ctx.work_pool.add_file(file.clone());
+            ctx.work_pool.add_file(file.to_string());
         }
         while is_compiling_core() && !is_interrupted() {
             thread::sleep(Duration::from_millis(50));
@@ -558,7 +646,7 @@ pub fn run_batch_with_pool(
     }
 
     let join_start = Instant::now();
-    let _seen_tests = stdout_handle.join().unwrap_or_default();
+    let (seen_tests, saw_summary) = stdout_handle.join().unwrap_or_default();
     let stdout_join_time = join_start.elapsed();
 
     let stderr_join_start = Instant::now();
@@ -569,11 +657,42 @@ pub fn run_batch_with_pool(
         eprintln!("\nWARNING: Slow thread joins - stdout: {:.1}s, stderr: {:.1}s for {:?}",
             stdout_join_time.as_secs_f64(),
             stderr_join_time.as_secs_f64(),
-            ctx.test_files.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>()
+            ctx.test_files
         );
     }
 
     let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
+
+    // Detect crash: if we didn't see the summary and weren't interrupted/killed for compilation
+    if !saw_summary && !is_interrupted() && !killed_for_compilation {
+        let exit_info = format_exit_status(exit_status.as_ref());
+
+        // Since tests are now individual (with variant numbers), the crash must be
+        // caused by the first test we didn't see output for
+        let mut crashed_test: Option<String> = None;
+
+        for file in ctx.test_files {
+            let test_id = TestId::parse(file);
+            if !seen_tests.contains(&test_id.path) {
+                crashed_test = Some(file.clone());
+                break;
+            }
+        }
+
+        if let Some(test) = crashed_test {
+            eprintln!(
+                "\nERROR: slang-test crashed ({}), skipping: {}",
+                exit_info, test
+            );
+            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            ctx.failures.lock().unwrap().push(FailureInfo {
+                test_name: test.clone(),
+                output_lines: vec![format!("Test caused slang-test to crash ({})", exit_info)],
+                expected: None,
+                actual: None,
+            });
+        }
+    }
 
     collect_failure_output(&mut failed_outcomes, &stderr_lines);
 
@@ -599,14 +718,14 @@ pub struct TestRunner {
 impl TestRunner {
     pub fn new(args: crate::Args) -> Self {
         let machine_output = !crate::is_stderr_tty();
-        let timing_cache = TimingCache::load();
+        // Don't load timing cache yet - will be loaded concurrently with discovery
         Self {
             args,
             stats: Arc::new(TestStats::default()),
             failures: Arc::new(Mutex::new(Vec::new())),
             retried_tests: Arc::new(Mutex::new(HashSet::new())),
             machine_output,
-            timing_cache: Mutex::new(timing_cache),
+            timing_cache: Mutex::new(TimingCache::default()),
         }
     }
 
@@ -619,55 +738,111 @@ impl TestRunner {
         }
     }
 
-    fn predict_duration(&self, file: &PathBuf) -> f64 {
+    fn predict_duration(&self, file: &str) -> f64 {
         let api_filter = extract_api_filter(&self.args.extra_args);
         let cache = self.timing_cache.lock().unwrap();
-        cache.predict(&file.to_string_lossy(), api_filter.as_deref(), false)
+        cache.predict(file, api_filter.as_deref(), false)
     }
 
     pub fn run(&self) -> Result<bool> {
         let start_time = Instant::now();
 
-        let all_prefixes_are_files = !self.args.prefixes.is_empty()
-            && self.args.prefixes.iter().all(|p| {
-                let path = PathBuf::from(p);
-                path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext == "slang" || ext == "hlsl" || ext == "glsl" || ext == "c")
+        // Load timing cache concurrently with test discovery (via channel)
+        let load_cache = !self.args.no_timing_cache;
+        let (cache_tx, cache_rx) = crossbeam_channel::bounded::<TimingCache>(1);
+        if load_cache {
+            thread::spawn(move || {
+                let cache = TimingCache::load();
+                let _ = cache_tx.send(cache);
             });
+        }
 
-        let has_internal_prefix = self
-            .args
-            .prefixes
-            .iter()
-            .any(|p| p.contains("slang-unit-test-tool") || p.ends_with('/'));
+        // Discover tests via slang-test -dry-run (streaming)
+        let rx = crate::discover_tests_streaming(
+            self.args.slang_test.as_ref().unwrap(),
+            &self.args.root_dir,
+            &self.args.filters,
+            &self.args.ignore_patterns,
+        )?;
 
-        if all_prefixes_are_files {
-            let test_files: Vec<PathBuf> = self
-                .args
-                .prefixes
-                .iter()
-                .filter(|p| {
-                    !self
-                        .args
-                        .ignore_patterns
-                        .iter()
-                        .any(|ignore| p.contains(ignore))
-                })
-                .map(PathBuf::from)
-                .collect();
-            self.run_file_tests(&test_files)?;
-        } else if has_internal_prefix || !self.args.prefixes.is_empty() {
-            self.run_with_prefixes()?;
-        } else {
-            let test_files =
-                crate::discover_test_files(&self.args.test_dir, &[], &self.args.ignore_patterns)?;
-            if !test_files.is_empty() {
-                self.run_file_tests(&test_files)?;
-            } else {
-                self.run_with_prefixes()?;
+        // Collect tests while showing streaming progress (in TTY mode)
+        let mut test_files: Vec<String> = Vec::new();
+        let mut cache_for_display: Option<TimingCache> = None;
+        let mut total_predicted: f64 = 0.0;
+        let api_filter = extract_api_filter(&self.args.extra_args);
+
+        for test in rx {
+            // Check if cache finished loading (non-blocking)
+            if cache_for_display.is_none() {
+                if let Ok(cache) = cache_rx.try_recv() {
+                    // Cache just loaded - compute predictions for all tests we've collected so far
+                    total_predicted = test_files.iter()
+                        .map(|f| cache.predict(f, api_filter.as_deref(), true))
+                        .sum();
+                    cache_for_display = Some(cache);
+                }
             }
+
+            // Add prediction for this test incrementally (if cache is loaded)
+            if let Some(ref cache) = cache_for_display {
+                total_predicted += cache.predict(&test, api_filter.as_deref(), true);
+            }
+
+            test_files.push(test);
+
+            // Update progress display (only in TTY mode)
+            if !self.machine_output {
+                if cache_for_display.is_some() {
+                    // Show count with prediction
+                    let eta = total_predicted / self.args.jobs as f64;
+                    eprint!(
+                        "\r\x1b[KRunning {} tests with {} workers (predicted {:.0}s with cached timing)",
+                        test_files.len(),
+                        self.args.jobs,
+                        eta
+                    );
+                } else {
+                    // Show count without prediction
+                    eprint!(
+                        "\r\x1b[KRunning {} tests with {} workers",
+                        test_files.len(),
+                        self.args.jobs
+                    );
+                }
+                let _ = std::io::stderr().flush();
+            }
+        }
+
+        // Clear the discovery line
+        if !self.machine_output && !test_files.is_empty() {
+            eprint!("\r\x1b[K");
+            let _ = std::io::stderr().flush();
+        }
+
+        // Wait for cache loading to complete if not already done
+        if let Some(cache) = cache_for_display {
+            *self.timing_cache.lock().unwrap() = cache;
+        } else if load_cache {
+            // Cache wasn't received during discovery, wait for it now
+            if let Ok(cache) = cache_rx.recv() {
+                *self.timing_cache.lock().unwrap() = cache;
+            }
+        }
+
+        // Sort tests for deterministic ordering
+        test_files.sort();
+
+        if test_files.is_empty() {
+            eprintln!("No tests found matching the specified criteria");
+        } else if self.args.dry_run {
+            // Just print the tests that would be run
+            for test in &test_files {
+                println!("{}", test);
+            }
+            eprintln!("{} tests would be run", test_files.len());
+            return Ok(true);
+        } else {
+            self.run_file_tests(&test_files)?;
         }
 
         let elapsed = start_time.elapsed();
@@ -681,146 +856,7 @@ impl TestRunner {
         Ok(self.stats.failed.load(Ordering::SeqCst) == 0 && !is_interrupted())
     }
 
-    fn run_with_prefixes(&self) -> Result<()> {
-        let mut cmd = Command::new(self.args.slang_test.as_ref().unwrap());
-
-        if self.args.hide_ignored {
-            cmd.arg("-hide-ignored");
-        }
-
-        cmd.args(&self.args.prefixes)
-            .args(&self.args.extra_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to spawn slang-test")?;
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        let stats = self.stats.clone();
-        let failures = self.failures.clone();
-        let failures_for_thread = failures.clone();
-
-        let progress_stats = stats.clone();
-        let machine_output = self.machine_output;
-        let progress_shutdown = Arc::new(AtomicBool::new(false));
-        let progress_shutdown_clone = progress_shutdown.clone();
-        let progress_handle = thread::spawn(move || {
-            let start = Instant::now();
-            let mut last_total = 0;
-            while !progress_shutdown_clone.load(Ordering::SeqCst) {
-                let passed = progress_stats.passed.load(Ordering::SeqCst);
-                let failed = progress_stats.failed.load(Ordering::SeqCst);
-                let ignored = progress_stats.ignored.load(Ordering::SeqCst);
-                let total = passed + failed + ignored;
-                let elapsed = start.elapsed().as_secs_f64();
-
-                if machine_output {
-                    if total >= last_total + 100 {
-                        last_total = total;
-                        eprintln!(
-                            "[{}] {} passed, {} failed, {} ignored ({:.1}s)",
-                            total, passed, failed, ignored, elapsed
-                        );
-                    }
-                } else {
-                    eprint!(
-                        "\r\x1b[KRunning: {} passed, {} failed, {} ignored ({:.1}s)",
-                        passed, failed, ignored, elapsed
-                    );
-                    let _ = std::io::stderr().flush();
-                }
-
-                thread::sleep(Duration::from_millis(100));
-            }
-        });
-
-        let stdout_handle = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            let mut pending_failure_lines: Vec<String> = Vec::new();
-
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    if let Some(outcome) = parse_test_output(&line) {
-                        match outcome.result {
-                            TestResult::Passed => {
-                                stats.passed.fetch_add(1, Ordering::SeqCst);
-                                pending_failure_lines.clear();
-                            }
-                            TestResult::Failed => {
-                                stats.failed.fetch_add(1, Ordering::SeqCst);
-                                let info = parse_failure_info(&outcome.name, &pending_failure_lines);
-                                failures_for_thread.lock().unwrap().push(info);
-                                pending_failure_lines.clear();
-                            }
-                            TestResult::Ignored => {
-                                stats.ignored.fetch_add(1, Ordering::SeqCst);
-                                pending_failure_lines.clear();
-                            }
-                        }
-                    } else {
-                        if line.starts_with('[') || !pending_failure_lines.is_empty() {
-                            pending_failure_lines.push(line);
-                        }
-                    }
-                }
-            }
-        });
-
-        let (stderr_tx, stderr_rx) = crossbeam_channel::unbounded::<String>();
-        let stderr_handle = thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let _ = stderr_tx.send(line);
-                }
-            }
-        });
-
-        stdout_handle.join().unwrap();
-        stderr_handle.join().unwrap();
-
-        let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
-
-        let mut failures_guard = failures.lock().unwrap();
-        for failure in failures_guard.iter_mut() {
-            let test_prefix = format!("[{}]", failure.test_name);
-            let mut capture = false;
-            let mut relevant_lines: Vec<String> = Vec::new();
-
-            for line in &stderr_lines {
-                if line.starts_with(&test_prefix) {
-                    capture = true;
-                }
-                if capture {
-                    relevant_lines.push(line.clone());
-                    if line.contains("}}}") && relevant_lines.iter().filter(|l| l.contains("}}}")).count() >= 2 {
-                        break;
-                    }
-                }
-            }
-
-            if !relevant_lines.is_empty() {
-                let info = parse_failure_info(&failure.test_name, &relevant_lines);
-                failure.output_lines = info.output_lines;
-                failure.expected = info.expected;
-                failure.actual = info.actual;
-            }
-        }
-        drop(failures_guard);
-
-        progress_shutdown.store(true, Ordering::SeqCst);
-        let _ = progress_handle.join();
-        if !self.machine_output {
-            eprint!("\r\x1b[K");
-            let _ = std::io::stderr().flush();
-        }
-
-        let _ = child.wait();
-        Ok(())
-    }
-
-    fn run_file_tests(&self, test_files: &[PathBuf]) -> Result<()> {
+    fn run_file_tests(&self, test_files: &[String]) -> Result<()> {
         if test_files.is_empty() {
             return Ok(());
         }
@@ -830,14 +866,14 @@ impl TestRunner {
             !cache.timings.is_empty()
         };
 
-        let sorted_files: Vec<PathBuf> = if has_timing_data {
+        let sorted_files: Vec<String> = if has_timing_data {
             let mut files_with_duration: Vec<_> = test_files.iter()
                 .map(|f| (f.clone(), self.predict_duration(f)))
                 .collect();
             files_with_duration.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let n = self.args.jobs;
-            let mut slots: Vec<Vec<PathBuf>> = (0..n).map(|_| Vec::new()).collect();
+            let mut slots: Vec<Vec<String>> = (0..n).map(|_| Vec::new()).collect();
 
             for (i, (file, _)) in files_with_duration.into_iter().enumerate() {
                 slots[i % n].push(file);
@@ -862,12 +898,11 @@ impl TestRunner {
             let cache = self.timing_cache.lock().unwrap();
             sorted_files.iter()
                 .map(|f| {
-                    let key = f.to_string_lossy().to_string();
-                    let pred = cache.predict(&key, api_filter.as_deref(), false);
-                    let startup = cache.timings.get(&key)
+                    let pred = cache.predict(f, api_filter.as_deref(), false);
+                    let startup = cache.timings.get(f)
                         .and_then(|backends| backends.get("_startup").copied())
                         .unwrap_or(0.0);
-                    ((key.clone(), pred), (key, startup))
+                    ((f.clone(), pred), (f.clone(), startup))
                 })
                 .unzip()
         };
@@ -877,14 +912,14 @@ impl TestRunner {
                 .map(|(pred, startup)| pred + startup)
                 .sum();
             eprintln!(
-                "Running {} test files with {} workers (predicted {:.0}s with cached timing)",
+                "Running {} tests with {} workers (predicted {:.0}s with cached timing)",
                 test_files.len(),
                 self.args.jobs,
                 total_predicted / self.args.jobs as f64
             );
         } else {
             eprintln!(
-                "Running {} test files with {} workers",
+                "Running {} tests with {} workers",
                 test_files.len(),
                 self.args.jobs
             );
@@ -1025,7 +1060,7 @@ impl TestRunner {
 
                                 adaptive_counter.fetch_add(1, Ordering::SeqCst);
                                 log_event("turbo_spawn", &format!("total_running={} file={}",
-                                    total_running, batch[0].file_name().unwrap_or_default().to_string_lossy()));
+                                    total_running, &batch[0]));
 
                                 let handle = thread::spawn(move || {
                                     run_batch_with_pool(
@@ -1359,7 +1394,7 @@ impl TestRunner {
 
             let has_file_tests = test_files.iter().any(|f| f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl") || f.ends_with(".c"));
 
-            let exe = std::env::args().next().unwrap_or_else(|| "slang-test-runner".to_string());
+            let exe = std::env::args().next().unwrap_or_else(|| "sti".to_string());
             if has_file_tests {
                 print!("{}", exe);
                 if self.args.root_dir != PathBuf::from(".") {

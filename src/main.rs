@@ -3,9 +3,9 @@ mod types;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossbeam_channel;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use walkdir::WalkDir;
 
 use runner::{set_interrupted, TestRunner};
 use types::{flush_event_log, init_event_log, log_event};
@@ -15,7 +15,7 @@ use types::{flush_event_log, init_event_log, log_event};
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "slang-test-runner")]
+#[command(name = "sti")]
 #[command(about = "A parallel test runner for slang-test with better output")]
 pub struct Args {
     /// Root directory of the slang project (defaults to current directory)
@@ -31,10 +31,6 @@ pub struct Args {
     /// If not specified, uses the newest available build
     #[arg(long)]
     pub build_type: Option<String>,
-
-    /// Test directory (relative to root_dir or absolute)
-    #[arg(long, default_value = "tests")]
-    pub test_dir: PathBuf,
 
     /// Number of parallel workers
     #[arg(short = 'j', long, default_value_t = num_cpus())]
@@ -52,15 +48,16 @@ pub struct Args {
     #[arg(long, default_value_t = 2)]
     pub retries: usize,
 
-    /// Test prefixes to run (if empty, runs all tests)
+    /// Test filter regexes (union: test runs if it matches ANY filter; if empty, runs all tests)
+    /// Examples: "^tests/compute" (prefix), "diagnostic" (infix), "\.slang$" (suffix)
     #[arg()]
-    pub prefixes: Vec<String>,
+    pub filters: Vec<String>,
 
     /// Hide ignored tests from output
     #[arg(long)]
     pub hide_ignored: bool,
 
-    /// Test patterns to ignore (can be specified multiple times)
+    /// Ignore patterns as regexes (union: test is ignored if it matches ANY pattern)
     #[arg(long = "ignore")]
     pub ignore_patterns: Vec<String>,
 
@@ -87,6 +84,10 @@ pub struct Args {
     /// Write event log to file for performance debugging
     #[arg(long)]
     pub event_log: Option<PathBuf>,
+
+    /// List tests that would be run without actually running them
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 // ============================================================================
@@ -103,39 +104,142 @@ pub fn is_stderr_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
-pub fn discover_test_files(
-    test_dir: &PathBuf,
-    prefixes: &[String],
+/// Discover all tests using slang-test -dry-run (blocking version)
+/// Returns a list of test identifiers which can be:
+/// - Simple: "tests/path/file.slang"
+/// - With variant: "tests/path/file.slang.0 (vk)"
+/// - Synthesized: "tests/path/file.slang.1 syn (llvm)"
+/// - Internal: "slang-unit-test-tool/modulePtr.internal"
+/// Filters support regex patterns (e.g., "^tests/compute" for prefix, "diagnostic" for infix)
+pub fn discover_tests_via_dry_run(
+    slang_test: &PathBuf,
+    root_dir: &PathBuf,
+    filters: &[String],
     ignore_patterns: &[String],
-) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let extensions = ["slang", "hlsl", "glsl", "c"];
+) -> Result<Vec<String>> {
+    let rx = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns)?;
+    let mut tests: Vec<String> = rx.iter().collect();
+    tests.sort();
+    Ok(tests)
+}
 
-    for entry in WalkDir::new(test_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if extensions.iter().any(|e| ext == *e) {
-                    let path_str = path.to_string_lossy();
+/// Discover tests using slang-test -dry-run, streaming results via channel
+/// Tests are sent as they are discovered, unsorted
+pub fn discover_tests_streaming(
+    slang_test: &PathBuf,
+    root_dir: &PathBuf,
+    filters: &[String],
+    ignore_patterns: &[String],
+) -> Result<crossbeam_channel::Receiver<String>> {
+    use regex::Regex;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
-                    if ignore_patterns.iter().any(|p| path_str.contains(p)) {
-                        continue;
-                    }
+    // Compile filter regexes upfront
+    let filter_regexes: Vec<Regex> = filters
+        .iter()
+        .map(|p| Regex::new(p).with_context(|| format!("Invalid filter regex: {}", p)))
+        .collect::<Result<Vec<_>>>()?;
 
-                    if prefixes.is_empty() || prefixes.iter().any(|p| path_str.contains(p)) {
-                        files.push(path.to_path_buf());
-                    }
+    let ignore_regexes: Vec<Regex> = ignore_patterns
+        .iter()
+        .map(|p| Regex::new(p).with_context(|| format!("Invalid ignore regex: {}", p)))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Try to use stdbuf to force line-buffering (avoids delay waiting for "no tests run")
+    // Falls back to running slang-test directly if stdbuf isn't available
+    let (mut child, using_stdbuf) = {
+        #[cfg(unix)]
+        {
+            let stdbuf_result = Command::new("stdbuf")
+                .arg("-oL")
+                .arg(slang_test)
+                .arg("-dry-run")
+                .arg("-skip-api-detection")
+                .current_dir(root_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+
+            match stdbuf_result {
+                Ok(child) => (child, true),
+                Err(_) => {
+                    // stdbuf not available, fall back to direct execution
+                    let child = Command::new(slang_test)
+                        .arg("-dry-run")
+                        .arg("-skip-api-detection")
+                        .current_dir(root_dir)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
+                    (child, false)
                 }
             }
         }
-    }
+        #[cfg(not(unix))]
+        {
+            let child = Command::new(slang_test)
+                .arg("-dry-run")
+                .arg("-skip-api-detection")
+                .current_dir(root_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
+            (child, false)
+        }
+    };
+    let _ = using_stdbuf; // suppress unused warning
 
-    files.sort();
-    Ok(files)
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            // "no tests run" means we're done - send to reaper and return immediately
+            if line == "no tests run" {
+                runner::reap_process(child);
+                return;
+            }
+
+            // Skip header lines
+            if line.starts_with("Supported backends:") || line.starts_with("Check ") {
+                continue;
+            }
+
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Apply ignore patterns (regex)
+            if ignore_regexes.iter().any(|re| re.is_match(line)) {
+                continue;
+            }
+
+            // Apply filter patterns (regex) - test must match at least one filter
+            if !filter_regexes.is_empty() && !filter_regexes.iter().any(|re| re.is_match(line)) {
+                continue;
+            }
+
+            if tx.send(line.to_string()).is_err() {
+                break;
+            }
+        }
+
+        // Send to reaper for async cleanup instead of blocking on wait
+        runner::reap_process(child);
+    });
+
+    Ok(rx)
 }
 
 fn detect_slang_test_build(
@@ -246,10 +350,28 @@ fn main() -> Result<()> {
         path
     };
 
-    args.slang_test = Some(slang_test_path);
+    args.slang_test = Some(slang_test_path.clone());
 
     std::env::set_current_dir(&root_dir)
         .with_context(|| format!("Failed to change to root directory: {}", root_dir.display()))?;
+
+    // Fast path for dry-run: skip TestRunner creation, stream output
+    if args.dry_run {
+        let rx = discover_tests_streaming(
+            &slang_test_path,
+            &root_dir,
+            &args.filters,
+            &args.ignore_patterns,
+        )?;
+
+        let mut count = 0;
+        for test in rx {
+            println!("{}", test);
+            count += 1;
+        }
+        eprintln!("{} tests would be run", count);
+        std::process::exit(0);
+    }
 
     let runner = TestRunner::new(args);
     let success = runner.run()?;

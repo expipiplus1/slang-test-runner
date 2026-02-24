@@ -1,5 +1,5 @@
 {
-  description = "Slang test runner";
+  description = "Slang Test Interceptor";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -22,7 +22,7 @@
 
         craneLibNative = crane.mkLib pkgsNative;
 
-        slang-test-runner = craneLibNative.buildPackage {
+        sti = craneLibNative.buildPackage {
           src = craneLibNative.cleanCargoSource ./.;
           strictDeps = true;
         };
@@ -96,34 +96,34 @@
         # (Apple's cctools/ld64 are only available on macOS). Build on macOS directly.
 
         # Linux static builds
-        slang-test-runner-x86_64-linux = mkStaticMuslPackage {
+        sti-x86_64-linux = mkStaticMuslPackage {
           target = "x86_64";
           linkerEnv = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER";
         };
 
-        slang-test-runner-aarch64-linux = mkStaticMuslPackage {
+        sti-aarch64-linux = mkStaticMuslPackage {
           target = "aarch64";
           linkerEnv = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER";
         };
 
         # Windows build
-        slang-test-runner-x86_64-windows = mkWindowsX86_64Package;
+        sti-x86_64-windows = mkWindowsX86_64Package;
       in
       {
         packages = {
-          default = slang-test-runner;
+          default = sti;
 
           # Cross-compiled static Linux binaries (no external dependencies)
-          x86_64-linux-static = slang-test-runner-x86_64-linux;
-          aarch64-linux-static = slang-test-runner-aarch64-linux;
+          x86_64-linux-static = sti-x86_64-linux;
+          aarch64-linux-static = sti-aarch64-linux;
 
           # Cross-compiled Windows binary
-          x86_64-windows = slang-test-runner-x86_64-windows;
+          x86_64-windows = sti-x86_64-windows;
         };
 
         apps.default = {
           type = "app";
-          program = "${slang-test-runner}/bin/slang-test-runner";
+          program = "${sti}/bin/sti";
         };
 
         devShells.default = craneLibNative.devShell {
