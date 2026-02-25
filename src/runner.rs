@@ -1121,6 +1121,10 @@ impl TestRunner {
     }
 
     pub fn save_timing(&self) {
+        // Don't save if --no-timing-cache was used
+        if self.args.no_timing_cache {
+            return;
+        }
         // Only save if we have a known build type
         let Some(build_type) = self.build_type else {
             return;
