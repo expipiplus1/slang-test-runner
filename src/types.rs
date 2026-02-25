@@ -517,11 +517,62 @@ pub struct FailureInfo {
 }
 
 // ============================================================================
-// Work Pool
+// Scheduler - Message-Passing Architecture
 // ============================================================================
+//
+// The scheduler owns all batch scheduling state and runs in a dedicated thread.
+// Workers communicate via messages, eliminating lock ordering complexity.
+//
+// Architecture:
+//   - Scheduler thread: owns batches, pending_files, in_flight, etc.
+//   - SchedulerHandle: cloneable handle for workers to send messages
+//   - All state mutations happen in the scheduler thread (no mutexes!)
 
-/// Tracks an in-flight batch: when it started, its predicted duration, and test count
-#[derive(Clone)]
+/// Message sent from workers to the scheduler
+pub enum SchedulerMessage {
+    /// Worker requests a batch to execute.
+    /// The scheduler decides what batch to give based on GPU availability.
+    GetBatch {
+        response_tx: crossbeam_channel::Sender<Option<BatchAssignment>>,
+    },
+    /// Worker completed a batch
+    CompleteBatch { batch_id: usize },
+    /// Worker wants to retry/repool tests (e.g., after crash)
+    AddTests { tests: Vec<String> },
+    /// Query: get atomic status snapshot (for progress display and termination check)
+    GetStatus {
+        num_workers: usize,
+        response_tx: crossbeam_channel::Sender<SchedulerStatus>,
+    },
+    /// Shutdown the scheduler
+    Shutdown,
+}
+
+/// Snapshot of scheduler state for progress display.
+/// Returned atomically to avoid TOCTOU issues.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulerStatus {
+    /// Is the scheduler completely empty?
+    pub is_empty: bool,
+    /// Number of tests remaining (in pool + in-flight)
+    pub remaining: usize,
+    /// Calculated ETA in seconds
+    pub eta: f64,
+    /// Are there batches waiting (not in-flight)?
+    pub has_pending_batches: bool,
+    /// Debug info: (batches_count, pending_count, in_flight_ids)
+    pub debug_state: (usize, usize, Vec<usize>),
+}
+
+/// A batch assignment returned to a worker
+#[derive(Debug, Clone)]
+pub struct BatchAssignment {
+    pub batch_id: usize,
+    pub tests: Vec<String>,
+    pub kind: BatchKind,
+}
+
+/// Tracks an in-flight batch
 struct InFlightBatch {
     start_time: Instant,
     predicted_duration: f64,
@@ -535,48 +586,46 @@ struct BatchWithKind {
     kind: BatchKind,
 }
 
-/// Work pool for distributing test batches to workers.
-///
-/// LOCK ORDERING: To avoid deadlocks, locks must always be acquired in this order:
-///   1. pending_files
-///   2. batches
-///   3. pool_predicted
-///   4. in_flight
-///
-/// Any method acquiring multiple locks must follow this order.
-pub struct WorkPool {
-    /// Pre-built batches of tests, ready to be popped by workers
-    batches: Mutex<Vec<BatchWithKind>>,
-    /// Pending files that need to be rebuilt into batches (retries, repooled after crash)
-    pending_files: Mutex<Vec<String>>,
-    /// In-flight batches keyed by batch ID (for tracking remaining time)
-    in_flight: Mutex<HashMap<usize, InFlightBatch>>,
+/// The scheduler owns all scheduling state and runs in a dedicated thread.
+/// No mutexes needed - all state is owned by the single scheduler thread.
+pub struct Scheduler {
+    /// Channel to receive messages from workers
+    rx: crossbeam_channel::Receiver<SchedulerMessage>,
+
+    /// Pre-built batches of tests, ready to be handed to workers
+    batches: Vec<BatchWithKind>,
+    /// Pending files that need to be rebuilt into batches
+    pending_files: Vec<String>,
+    /// In-flight batches keyed by batch ID
+    in_flight: HashMap<usize, InFlightBatch>,
     /// Counter for generating batch IDs
-    next_batch_id: AtomicUsize,
-    /// Predicted time for tests still in the pool (not in-flight, not completed)
-    pool_predicted: Mutex<f64>,
-    /// Configuration for batch building
+    next_batch_id: usize,
+    /// Predicted time for tests still in the pool
+    pool_predicted: f64,
+
+    /// Configuration
     max_batch_size: usize,
     target_batch_duration: f64,
-    /// Predictions keyed by test identifier (e.g., "tests/foo.slang.4")
-    pub predictions: HashMap<String, f64>,
-    pub has_timing_data: bool,
-    /// Maximum concurrent GPU batches (None = no limit, batches are Mixed)
+    predictions: HashMap<String, f64>,
+    has_timing_data: bool,
     gpu_jobs: Option<usize>,
-    /// Current number of in-flight GPU batches
-    gpu_in_flight: AtomicUsize,
+    gpu_in_flight: usize,
 }
 
-impl WorkPool {
+impl Scheduler {
+    /// Create a new scheduler and return (scheduler, handle).
+    /// The scheduler should be run in a dedicated thread via `scheduler.run()`.
     pub fn new(
         files: Vec<String>,
         max_batch_size: usize,
-        _num_workers: usize,
+        num_workers: usize,
         predictions: HashMap<String, f64>,
         has_timing_data: bool,
         target_batch_duration: f64,
         gpu_jobs: Option<usize>,
-    ) -> Self {
+    ) -> (Self, SchedulerHandle) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+
         let total_predicted: f64 = files.iter()
             .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
@@ -590,24 +639,83 @@ impl WorkPool {
             gpu_jobs,
         );
 
-        Self {
-            batches: Mutex::new(batches),
-            pending_files: Mutex::new(Vec::new()),
-            in_flight: Mutex::new(HashMap::new()),
-            next_batch_id: AtomicUsize::new(0),
-            pool_predicted: Mutex::new(total_predicted),
+        let predictions_arc = Arc::new(predictions.clone());
+
+        let scheduler = Self {
+            rx,
+            batches,
+            pending_files: Vec::new(),
+            in_flight: HashMap::new(),
+            next_batch_id: 0,
+            pool_predicted: total_predicted,
             max_batch_size,
             target_batch_duration,
             predictions,
             has_timing_data,
             gpu_jobs,
-            gpu_in_flight: AtomicUsize::new(0),
+            gpu_in_flight: 0,
+        };
+
+        let handle = SchedulerHandle {
+            tx,
+            predictions: predictions_arc,
+            has_timing_data,
+            num_workers,
+        };
+
+        (scheduler, handle)
+    }
+
+    /// Run the scheduler message loop. Call this in a dedicated thread.
+    /// Returns when Shutdown message is received or all senders are dropped.
+    pub fn run(&mut self) {
+        while let Ok(msg) = self.rx.recv() {
+            match msg {
+                SchedulerMessage::GetBatch { response_tx } => {
+                    let batch = self.try_get_batch();
+                    let _ = response_tx.send(batch);
+                }
+                SchedulerMessage::CompleteBatch { batch_id } => {
+                    self.complete_batch(batch_id);
+                }
+                SchedulerMessage::AddTests { tests } => {
+                    self.add_tests(tests);
+                }
+                SchedulerMessage::GetStatus { num_workers, response_tx } => {
+                    let status = self.get_status(num_workers);
+                    let _ = response_tx.send(status);
+                }
+                SchedulerMessage::Shutdown => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get atomic status snapshot
+    fn get_status(&self, num_workers: usize) -> SchedulerStatus {
+        let pool_count: usize = self.batches.iter()
+            .map(|b| b.tests.len()).sum::<usize>()
+            + self.pending_files.len();
+        let in_flight_count: usize = self.in_flight.values()
+            .map(|b| b.test_count).sum();
+
+        SchedulerStatus {
+            is_empty: self.pending_files.is_empty()
+                && self.batches.is_empty()
+                && self.in_flight.is_empty(),
+            remaining: pool_count + in_flight_count,
+            eta: self.calculate_eta(num_workers),
+            has_pending_batches: !self.pending_files.is_empty() || !self.batches.is_empty(),
+            debug_state: (
+                self.batches.len(),
+                self.pending_files.len(),
+                self.in_flight.keys().copied().collect(),
+            ),
         }
     }
 
     /// Build batches from a list of files.
-    /// Files should be pre-sorted by duration (slowest first) if timing data is available.
-    /// When gpu_jobs is Some, tests are segmented into GPU-only and CPU-only batches.
     fn build_batches(
         files: Vec<String>,
         predictions: &HashMap<String, f64>,
@@ -728,186 +836,196 @@ impl WorkPool {
         batches
     }
 
-    /// Add a file back to the pool (for retries or repooled tests after crash).
-    /// This triggers a rebuild of batches on the next try_get_batch call.
-    pub fn add_file(&self, file: String) {
-        let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-        // Lock order must match try_get_batch: pending_files first, then pool_predicted
-        let mut pending = self.pending_files.lock().unwrap();
-        *self.pool_predicted.lock().unwrap() += predicted;
-        pending.push(file);
-    }
-
-    /// Check if the pool is empty.
-    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
-    pub fn is_empty(&self) -> bool {
-        // Lock in same order as try_get_batch to avoid deadlock
-        let pending = self.pending_files.lock().unwrap();
-        let batches = self.batches.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap();
-        pending.is_empty() && batches.is_empty() && in_flight.is_empty()
-    }
-
-    /// Get debug info about pool state: (batches_count, pending_count, in_flight_ids)
-    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
-    pub fn debug_state(&self) -> (usize, usize, Vec<usize>) {
-        // Lock in same order as try_get_batch to avoid deadlock
-        let pending = self.pending_files.lock().unwrap();
-        let batches = self.batches.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap();
-        (
-            batches.len(),
-            pending.len(),
-            in_flight.keys().copied().collect(),
-        )
-    }
-
-    /// Check if there are batches waiting to be picked up (excluding in-flight)
-    /// IMPORTANT: Lock order must be pending_files -> batches (same as try_get_batch)
-    pub fn has_pending_batches(&self) -> bool {
-        let pending = self.pending_files.lock().unwrap();
-        let batches = self.batches.lock().unwrap();
-        !pending.is_empty() || !batches.is_empty()
-    }
-
-    /// Returns number of tests remaining (in pool + in-flight)
-    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
-    pub fn remaining(&self) -> usize {
-        let pending = self.pending_files.lock().unwrap();
-        let batches = self.batches.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap();
-        let pool_count: usize = batches.iter().map(|b| b.tests.len()).sum::<usize>() + pending.len();
-        let in_flight_count: usize = in_flight.values().map(|b| b.test_count).sum();
-        pool_count + in_flight_count
-    }
-
-    /// Check if there's a GPU slot available
-    pub fn can_take_gpu_batch(&self) -> bool {
-        match self.gpu_jobs {
-            None => true, // No GPU limiting
-            Some(max) => self.gpu_in_flight.load(Ordering::SeqCst) < max,
+    /// Add tests back to the pool (for retries or repooled tests after crash).
+    fn add_tests(&mut self, tests: Vec<String>) {
+        for file in tests {
+            let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+            self.pool_predicted += predicted;
+            self.pending_files.push(file);
         }
     }
 
-    /// Get the next batch of tests to run.
-    /// Returns (batch_id, tests, kind) where batch_id is used to mark the batch complete later.
-    /// If there are pending files (retries/repooled), rebuilds batches first.
-    ///
-    /// When `has_gpu_slot` is false and gpu_jobs is set, GPU batches will be skipped.
-    pub fn try_get_batch(&self, has_gpu_slot: bool) -> Option<(usize, Vec<String>, BatchKind)> {
-        // Check if we need to rebuild batches due to pending files
-        {
-            let mut pending = self.pending_files.lock().unwrap();
-            if !pending.is_empty() {
-                let mut batches = self.batches.lock().unwrap();
-                let mut pool_predicted = self.pool_predicted.lock().unwrap();
-
-                // Collect all remaining tests: pending + already batched
-                let mut all_files: Vec<String> = pending.drain(..).collect();
-                for batch in batches.drain(..) {
-                    all_files.extend(batch.tests);
-                }
-
-                // Recalculate pool_predicted from all_files
-                *pool_predicted = all_files.iter()
-                    .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                    .sum();
-
-                // Rebuild batches
-                *batches = Self::build_batches(
-                    all_files,
-                    &self.predictions,
-                    self.has_timing_data,
-                    self.max_batch_size,
-                    self.target_batch_duration,
-                    self.gpu_jobs,
-                );
+    /// Rebuild batches if there are pending files, then get the next batch.
+    /// The scheduler decides internally whether to give a GPU or CPU batch
+    /// based on current gpu_in_flight count vs gpu_jobs limit.
+    fn try_get_batch(&mut self) -> Option<BatchAssignment> {
+        // Rebuild batches if we have pending files
+        if !self.pending_files.is_empty() {
+            // Collect all remaining tests: pending + already batched
+            let mut all_files: Vec<String> = std::mem::take(&mut self.pending_files);
+            for batch in self.batches.drain(..) {
+                all_files.extend(batch.tests);
             }
+
+            // Recalculate pool_predicted from all_files
+            self.pool_predicted = all_files.iter()
+                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum();
+
+            // Rebuild batches
+            self.batches = Self::build_batches(
+                all_files,
+                &self.predictions,
+                self.has_timing_data,
+                self.max_batch_size,
+                self.target_batch_duration,
+                self.gpu_jobs,
+            );
         }
+
+        // Determine if we can give out a GPU batch (check limit atomically here)
+        let can_give_gpu = match self.gpu_jobs {
+            None => true, // No GPU limiting
+            Some(max) => self.gpu_in_flight < max,
+        };
 
         // Find and pop an appropriate batch
-        let batch_with_kind = {
-            let mut batches = self.batches.lock().unwrap();
-
-            if self.gpu_jobs.is_none() || has_gpu_slot {
-                // No GPU limiting or we have a slot - just pop the next batch
-                batches.pop()
-            } else {
-                // GPU limiting is active and we don't have a slot - find a CPU batch
-                // Search from the end (where we pop from) for efficiency
-                let mut cpu_idx = None;
-                for (i, batch) in batches.iter().enumerate().rev() {
-                    if batch.kind == BatchKind::Cpu {
-                        cpu_idx = Some(i);
-                        break;
-                    }
+        let batch_with_kind = if self.gpu_jobs.is_none() {
+            // No GPU limiting - just pop any batch
+            self.batches.pop()
+        } else if can_give_gpu {
+            // GPU slot available - pop any batch (GPU or CPU)
+            self.batches.pop()
+        } else {
+            // GPU slots full - must find a CPU batch only
+            let mut cpu_idx = None;
+            for (i, batch) in self.batches.iter().enumerate().rev() {
+                if batch.kind == BatchKind::Cpu {
+                    cpu_idx = Some(i);
+                    break;
                 }
-                cpu_idx.map(|i| batches.remove(i))
             }
+            cpu_idx.map(|i| self.batches.remove(i))
         }?;
 
-        let batch = batch_with_kind.tests;
+        let tests = batch_with_kind.tests;
         let kind = batch_with_kind.kind;
 
         // Calculate predicted duration for this batch
-        let predicted_duration: f64 = batch.iter()
+        let predicted_duration: f64 = tests.iter()
             .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
 
         // Subtract from pool predicted
-        *self.pool_predicted.lock().unwrap() -= predicted_duration;
+        self.pool_predicted -= predicted_duration;
 
         // Track GPU batch count
         if kind == BatchKind::Gpu {
-            self.gpu_in_flight.fetch_add(1, Ordering::SeqCst);
+            self.gpu_in_flight += 1;
         }
 
         // Track as in-flight
-        let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
-        let test_count = batch.len();
-        self.in_flight.lock().unwrap().insert(batch_id, InFlightBatch {
+        let batch_id = self.next_batch_id;
+        self.next_batch_id += 1;
+        let test_count = tests.len();
+        self.in_flight.insert(batch_id, InFlightBatch {
             start_time: Instant::now(),
             predicted_duration,
             test_count,
             kind,
         });
 
-        Some((batch_id, batch, kind))
+        Some(BatchAssignment { batch_id, tests, kind })
     }
 
-    /// Mark a batch as complete (tests finished running)
-    pub fn complete_batch(&self, batch_id: usize) {
-        let removed = self.in_flight.lock().unwrap().remove(&batch_id);
-        if let Some(batch) = removed {
+    /// Mark a batch as complete
+    fn complete_batch(&mut self, batch_id: usize) {
+        if let Some(batch) = self.in_flight.remove(&batch_id) {
             if batch.kind == BatchKind::Gpu {
-                self.gpu_in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.gpu_in_flight -= 1;
             }
         }
     }
 
-    /// Calculate estimated time remaining.
-    /// Takes into account pool remaining, in-flight batch progress, and the "long pole" problem.
-    pub fn calculate_eta(&self, num_workers: usize) -> f64 {
-        let pool_remaining = *self.pool_predicted.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap();
-
+    /// Calculate estimated time remaining
+    fn calculate_eta(&self, num_workers: usize) -> f64 {
         let mut in_flight_remaining = 0.0f64;
         let mut longest_remaining = 0.0f64;
 
-        for batch in in_flight.values() {
+        for batch in self.in_flight.values() {
             let elapsed = batch.start_time.elapsed().as_secs_f64();
             let remaining = (batch.predicted_duration - elapsed).max(0.0);
             in_flight_remaining += remaining;
             longest_remaining = longest_remaining.max(remaining);
         }
 
-        let total_remaining = pool_remaining + in_flight_remaining;
+        let total_remaining = self.pool_predicted + in_flight_remaining;
         let parallel_eta = total_remaining / num_workers.max(1) as f64;
 
-        // ETA is the max of parallel completion time and the longest single batch
         parallel_eta.max(longest_remaining)
     }
+}
 
+/// Handle for workers to communicate with the scheduler.
+/// This is cheap to clone and can be shared across threads.
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    tx: crossbeam_channel::Sender<SchedulerMessage>,
+    /// Read-only predictions for workers (avoids round-trip for lookups)
+    pub predictions: Arc<HashMap<String, f64>>,
+    pub has_timing_data: bool,
+    /// Number of workers (for ETA calculation in status queries)
+    num_workers: usize,
+}
+
+impl SchedulerHandle {
+    /// Request a batch from the scheduler. Returns None if no batches available.
+    /// The scheduler decides atomically whether to give a GPU or CPU batch
+    /// based on current state - no TOCTOU issues.
+    pub fn get_batch(&self) -> Option<BatchAssignment> {
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+        self.tx.send(SchedulerMessage::GetBatch { response_tx }).ok()?;
+        response_rx.recv().ok().flatten()
+    }
+
+    /// Notify the scheduler that a batch is complete
+    pub fn complete_batch(&self, batch_id: usize) {
+        let _ = self.tx.send(SchedulerMessage::CompleteBatch { batch_id });
+    }
+
+    /// Add tests back to the pool (for retries or repooled tests)
+    pub fn add_tests(&self, tests: Vec<String>) {
+        if !tests.is_empty() {
+            let _ = self.tx.send(SchedulerMessage::AddTests { tests });
+        }
+    }
+
+    /// Add a single test back to the pool
+    pub fn add_test(&self, test: String) {
+        self.add_tests(vec![test]);
+    }
+
+    /// Get atomic status snapshot from scheduler.
+    /// This is the only way to query scheduler state - all fields are
+    /// computed atomically to avoid TOCTOU issues.
+    pub fn get_status(&self) -> SchedulerStatus {
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+        if self.tx.send(SchedulerMessage::GetStatus {
+            num_workers: self.num_workers,
+            response_tx,
+        }).is_err() {
+            // Scheduler is gone, return "empty" status
+            return SchedulerStatus {
+                is_empty: true,
+                remaining: 0,
+                eta: 0.0,
+                has_pending_batches: false,
+                debug_state: (0, 0, vec![]),
+            };
+        }
+        response_rx.recv().unwrap_or(SchedulerStatus {
+            is_empty: true,
+            remaining: 0,
+            eta: 0.0,
+            has_pending_batches: false,
+            debug_state: (0, 0, vec![]),
+        })
+    }
+
+    /// Shutdown the scheduler
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(SchedulerMessage::Shutdown);
+    }
 }
 
 // ============================================================================
@@ -1216,7 +1334,7 @@ pub struct BatchContext<'a> {
     pub failures: &'a Mutex<Vec<FailureInfo>>,
     pub max_retries: usize,
     pub retried_tests: &'a Mutex<HashMap<String, usize>>,
-    pub work_pool: &'a Arc<WorkPool>,
+    pub scheduler: &'a SchedulerHandle,
     pub running: &'a AtomicUsize,
     pub machine_output: bool,
     pub verbose: bool,
@@ -1295,17 +1413,17 @@ mod tests {
         assert!(is_gpu_test("tests/compute/foo.slang.3 (dx12)"));
         assert!(is_gpu_test("tests/compute/foo.slang.4 (metal)"));
         assert!(is_gpu_test("tests/compute/foo.slang.5 (vulkan)"));
-        
+
         // GPU tests - gfx-unit-test-tool
         assert!(is_gpu_test("gfx-unit-test-tool/someTest.internal"));
         assert!(is_gpu_test("gfx-unit-test-tool/anotherTest.internal.0"));
-        
+
         // CPU tests
         assert!(!is_gpu_test("tests/compute/foo.slang.0 (cpu)"));
         assert!(!is_gpu_test("tests/compute/foo.slang.1 (llvm)"));
         assert!(!is_gpu_test("slang-unit-test-tool/modulePtr.internal"));
         assert!(!is_gpu_test("tests/compute/foo.slang")); // No API suffix
-        
+
         // Synthesized tests
         assert!(is_gpu_test("tests/compute/foo.slang.0 syn (vk)"));
         assert!(!is_gpu_test("tests/compute/foo.slang.0 syn (cpu)"));
@@ -1320,11 +1438,11 @@ mod tests {
             "tests/d.slang.0 (llvm)".to_string(),
             "gfx-unit-test-tool/test.internal".to_string(),
         ];
-        
+
         let predictions = HashMap::new();
-        
+
         // With gpu_jobs set, batches should be segmented
-        let batches = WorkPool::build_batches(
+        let batches = Scheduler::build_batches(
             files.clone(),
             &predictions,
             false,
@@ -1332,21 +1450,21 @@ mod tests {
             10.0,
             Some(2),
         );
-        
+
         // Should have at least one GPU batch and one CPU batch
         let gpu_batches: Vec<_> = batches.iter().filter(|b| b.kind == BatchKind::Gpu).collect();
         let cpu_batches: Vec<_> = batches.iter().filter(|b| b.kind == BatchKind::Cpu).collect();
-        
+
         assert!(!gpu_batches.is_empty(), "Should have GPU batches");
         assert!(!cpu_batches.is_empty(), "Should have CPU batches");
-        
+
         // Verify GPU batches only contain GPU tests
         for batch in &gpu_batches {
             for test in &batch.tests {
                 assert!(is_gpu_test(test), "GPU batch should only contain GPU tests: {}", test);
             }
         }
-        
+
         // Verify CPU batches only contain CPU tests
         for batch in &cpu_batches {
             for test in &batch.tests {
@@ -1361,11 +1479,11 @@ mod tests {
             "tests/a.slang.0 (vk)".to_string(),
             "tests/b.slang.0 (cpu)".to_string(),
         ];
-        
+
         let predictions = HashMap::new();
-        
+
         // Without gpu_jobs, all batches should be Mixed
-        let batches = WorkPool::build_batches(
+        let batches = Scheduler::build_batches(
             files,
             &predictions,
             false,
@@ -1373,7 +1491,7 @@ mod tests {
             10.0,
             None,
         );
-        
+
         for batch in &batches {
             assert_eq!(batch.kind, BatchKind::Mixed, "Without gpu_jobs, all batches should be Mixed");
         }

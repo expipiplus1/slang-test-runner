@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates};
+use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, Scheduler, SchedulerHandle};
 
 // ============================================================================
 // Debug Logging
@@ -348,7 +348,7 @@ fn should_retry_test(
     outcome: &TestOutcome,
     max_retries: usize,
     retried_tests: &Mutex<HashMap<String, usize>>,
-    work_pool: &Arc<WorkPool>,
+    scheduler: &SchedulerHandle,
 ) -> bool {
     if max_retries == 0 {
         return false;
@@ -370,7 +370,7 @@ fn should_retry_test(
             let file_path = PathBuf::from(&base_file);
             if file_path.exists() {
                 // Re-queue the test by its full name (with variant info if present)
-                work_pool.add_file(outcome.name.clone());
+                scheduler.add_test(outcome.name.clone());
                 return true;
             }
         }
@@ -401,7 +401,7 @@ fn process_outcome(
             false
         }
         TestResult::Failed => {
-            if should_retry_test(&outcome, ctx.max_retries, ctx.retried_tests, ctx.work_pool) {
+            if should_retry_test(&outcome, ctx.max_retries, ctx.retried_tests, ctx.scheduler) {
                 return true;
             }
             ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
@@ -426,7 +426,7 @@ pub fn run_batch_with_pool(
     failures: &Mutex<Vec<FailureInfo>>,
     max_retries: usize,
     retried_tests: &Mutex<HashMap<String, usize>>,
-    work_pool: &Arc<WorkPool>,
+    scheduler: &SchedulerHandle,
     running: &AtomicUsize,
     machine_output: bool,
     verbose: bool,
@@ -442,7 +442,7 @@ pub fn run_batch_with_pool(
         failures,
         max_retries,
         retried_tests,
-        work_pool,
+        scheduler,
         running,
         machine_output,
         verbose,
@@ -458,12 +458,12 @@ pub fn run_batch_with_pool(
     let batch_id = std::thread::current().id();
     let file_info: Vec<_> = ctx.test_files.iter()
         .map(|f| {
-            let pred = ctx.work_pool.predictions.get(f).copied().unwrap_or(0.0);
+            let pred = ctx.scheduler.predictions.get(f).copied().unwrap_or(0.0);
             format!("{}({:.2}s)", f, pred)
         })
         .collect();
     let total_pred: f64 = ctx.test_files.iter()
-        .map(|f| ctx.work_pool.predictions.get(f).copied().unwrap_or(0.0))
+        .map(|f| ctx.scheduler.predictions.get(f).copied().unwrap_or(0.0))
         .sum();
     log_event("batch_start", &format!("{:?} files={} pred={:.2}s items=[{}]",
         batch_id, ctx.test_files.len(), total_pred, file_info.join(" ")));
@@ -792,9 +792,8 @@ pub fn run_batch_with_pool(
         if let Some(state) = worker_state {
             state.clear();
         }
-        for file in ctx.test_files {
-            ctx.work_pool.add_file(file.to_string());
-        }
+        // Batch add all tests back to scheduler
+        ctx.scheduler.add_tests(ctx.test_files.iter().map(|s| s.to_string()).collect());
         debug_log!("waiting for core compilation to complete");
         while is_compiling_core() && !is_interrupted() {
             thread::sleep(Duration::from_millis(50));
@@ -858,9 +857,8 @@ pub fn run_batch_with_pool(
             debug_log!("test-caused crash, blaming {:?}, repooling {} tests",
                 crashed_test, tests_to_repool.len());
 
-            for test in &tests_to_repool {
-                ctx.work_pool.add_file(test.clone());
-            }
+            // Batch add tests back to scheduler
+            ctx.scheduler.add_tests(tests_to_repool.clone());
 
             if let Some(test) = crashed_test {
                 let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
@@ -899,9 +897,8 @@ pub fn run_batch_with_pool(
                 format!("slang-test killed externally ({}), repooling {} tests",
                     exit_info, unaccounted_tests.len()).dimmed()
             );
-            for test in &unaccounted_tests {
-                ctx.work_pool.add_file(test.clone());
-            }
+            // Batch add all unaccounted tests back to scheduler
+            ctx.scheduler.add_tests(unaccounted_tests);
         }
     }
 
@@ -1197,7 +1194,8 @@ impl TestRunner {
             eprintln!("{}", running_msg);
         }
 
-        let work_pool = Arc::new(WorkPool::new(
+        // Create scheduler and handle (message-passing architecture)
+        let (mut scheduler, scheduler_handle) = Scheduler::new(
             sorted_files,
             self.args.batch_size,
             self.args.jobs,
@@ -1205,7 +1203,7 @@ impl TestRunner {
             has_timing_data,
             self.args.batch_duration,
             self.args.gpu_jobs,
-        ));
+        );
 
         let stats = self.stats.clone();
         let failures = self.failures.clone();
@@ -1228,12 +1226,23 @@ impl TestRunner {
         // Mark execution started so progress display can show "waiting for output"
         stats.mark_execution_started();
 
-        debug_log!("about to spawn progress thread");
+        debug_log!("about to spawn scheduler thread");
 
-        // Spawn progress thread first
+        // Spawn scheduler thread
+        let scheduler_handle_for_check = scheduler_handle.clone();
+        let scheduler_thread = thread::Builder::new()
+            .name("scheduler".to_string())
+            .spawn(move || {
+                scheduler.run();
+            })
+            .expect("failed to spawn scheduler thread");
+
+        debug_log!("scheduler thread spawned, about to spawn progress thread");
+
+        // Spawn progress thread
         let progress_stats = stats.clone();
         let progress_running = running.clone();
-        let progress_pool = work_pool.clone();
+        let progress_handle_for_progress = scheduler_handle.clone();
         let progress_shutdown = Arc::new(AtomicBool::new(false));
         let progress_shutdown_clone = progress_shutdown.clone();
         let total_files = test_files.len();
@@ -1243,26 +1252,26 @@ impl TestRunner {
         let verbose_for_progress = self.args.verbose;
         let progress_handle = thread::spawn(move || {
             let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose_for_progress);
-            // Initialize SystemStats lazily to avoid blocking the first progress update
             let mut sys_stats: Option<SystemStats> = None;
             let mut stats_counter = 0u32;
             while !progress_shutdown_clone.load(Ordering::SeqCst) {
                 let files_done = progress_stats.files_completed();
                 let batches_running = progress_running.load(Ordering::SeqCst);
-                let batches_remaining = progress_pool.remaining();
-                let has_pending_batches = progress_pool.has_pending_batches();
-                let eta = if progress_pool.has_timing_data {
-                    Some(progress_pool.calculate_eta(num_workers))
+
+                // Get atomic status snapshot from scheduler
+                let status = progress_handle_for_progress.get_status();
+                let eta = if progress_handle_for_progress.has_timing_data {
+                    Some(status.eta)
                 } else {
                     None
                 };
-                display.update(&progress_stats, files_done, batches_running, batches_remaining, has_pending_batches, eta, progress_worker_states.as_deref());
+                display.update(&progress_stats, files_done, batches_running, status.remaining, status.has_pending_batches, eta, progress_worker_states.as_deref());
 
                 stats_counter += 1;
                 if stats_counter >= 10 {
                     stats_counter = 0;
                     let sys = sys_stats.get_or_insert_with(SystemStats::new);
-                    sys.refresh_and_log(batches_running, batches_remaining);
+                    sys.refresh_and_log(batches_running, status.remaining);
                 }
 
                 thread::sleep(Duration::from_millis(16));
@@ -1272,8 +1281,9 @@ impl TestRunner {
 
         debug_log!("progress thread spawned, about to spawn workers");
 
-        // Spawn worker threads
-        if !work_pool.is_empty() {
+        // Check if scheduler has work before spawning workers
+        let initial_status = scheduler_handle_for_check.get_status();
+        if !initial_status.is_empty {
             for i in 0..self.args.jobs {
                 debug_log!("spawning worker {}", i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
@@ -1282,7 +1292,7 @@ impl TestRunner {
                 let stats = stats.clone();
                 let failures = failures.clone();
                 let retried_tests = retried_tests.clone();
-                let pool = work_pool.clone();
+                let handle_for_worker = scheduler_handle.clone();
                 let running = running.clone();
                 let shutdown = shutdown.clone();
                 let machine_output = self.machine_output;
@@ -1305,40 +1315,38 @@ impl TestRunner {
                             break;
                         }
 
-                        // Check if we can take a GPU batch
-                        let has_gpu_slot = pool.can_take_gpu_batch();
-
                         let get_batch_start = Instant::now();
-                        if let Some((batch_id, batch, kind)) = pool.try_get_batch(has_gpu_slot) {
+                        // Scheduler decides atomically what batch to give (GPU or CPU)
+                        if let Some(assignment) = handle_for_worker.get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
-                                debug_log!("try_get_batch took {:.3}s", get_batch_time.as_secs_f64());
+                                debug_log!("get_batch took {:.3}s", get_batch_time.as_secs_f64());
                             }
-                            debug_log!("got batch {} of {} tests ({:?})", batch_id, batch.len(), kind);
+                            debug_log!("got batch {} of {} tests ({:?})", assignment.batch_id, assignment.tests.len(), assignment.kind);
                             run_batch_with_pool(
                                 &slang_test,
                                 &root_dir,
-                                &batch,
+                                &assignment.tests,
                                 &extra_args,
                                 timeout,
                                 &stats,
                                 &failures,
                                 retries,
                                 &retried_tests,
-                                &pool,
+                                &handle_for_worker,
                                 &running,
                                 machine_output,
                                 verbose,
                                 my_state,
                             );
-                            debug_log!("batch {} completed, calling complete_batch", batch_id);
-                            pool.complete_batch(batch_id);
-                            debug_log!("batch {} complete_batch done", batch_id);
+                            debug_log!("batch {} completed, calling complete_batch", assignment.batch_id);
+                            handle_for_worker.complete_batch(assignment.batch_id);
+                            debug_log!("batch {} complete_batch done", assignment.batch_id);
                         } else {
-                            // No batch available - log why and wait
-                            let (batches_count, pending_count, in_flight_ids) = pool.debug_state();
-                            debug_log!("no batch available: batches={} pending={} in_flight={:?} has_gpu_slot={}",
-                                batches_count, pending_count, in_flight_ids, has_gpu_slot);
+                            // No batch available - check status and wait
+                            let status = handle_for_worker.get_status();
+                            debug_log!("no batch available: batches={} pending={} in_flight={:?}",
+                                status.debug_state.0, status.debug_state.1, status.debug_state.2);
                             thread::sleep(Duration::from_millis(10));
                         }
                     }
@@ -1350,11 +1358,11 @@ impl TestRunner {
             debug_log!("all workers spawned, entering main loop");
 
             loop {
-                let pool_empty = work_pool.is_empty();
+                let status = scheduler_handle_for_check.get_status();
                 let running_count = running.load(Ordering::SeqCst);
 
-                if pool_empty && running_count == 0 {
-                    debug_log!("main loop: pool empty and no batches running, exiting");
+                if status.is_empty && running_count == 0 {
+                    debug_log!("main loop: scheduler empty and no batches running, exiting");
                     break;
                 }
 
@@ -1369,9 +1377,8 @@ impl TestRunner {
                 let last = LAST_LOG.load(Ordering::Relaxed);
                 if now_ms - last > 1000 {
                     LAST_LOG.store(now_ms, Ordering::Relaxed);
-                    let (batches_count, pending_count, in_flight_ids) = work_pool.debug_state();
                     debug_log!("main loop: running={} batches={} pending={} in_flight={:?}",
-                        running_count, batches_count, pending_count, in_flight_ids);
+                        running_count, status.debug_state.0, status.debug_state.1, status.debug_state.2);
                 }
 
                 thread::sleep(Duration::from_millis(20));
@@ -1383,11 +1390,15 @@ impl TestRunner {
             // Don't wait for workers - they'll exit on their own when they see shutdown
             debug_log!("dropping worker handles");
             drop(handles);
-
-            progress_shutdown.store(true, Ordering::SeqCst);
-            // Must join progress thread to ensure it stops writing before we print failures
-            let _ = progress_handle.join();
         }
+
+        // Shutdown scheduler and wait for it
+        scheduler_handle.shutdown();
+        let _ = scheduler_thread.join();
+
+        progress_shutdown.store(true, Ordering::SeqCst);
+        // Must join progress thread to ensure it stops writing before we print failures
+        let _ = progress_handle.join();
 
         Ok(())
     }
