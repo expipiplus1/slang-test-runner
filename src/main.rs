@@ -42,12 +42,12 @@ pub struct Args {
     #[arg(short = 'g', long)]
     pub gpu_jobs: Option<usize>,
 
-    /// Maximum files per batch (with timing data, batches target ~10s duration up to this limit)
-    #[arg(long, default_value_t = 100)]
+    /// Maximum files per batch (default: (num_tests/jobs)*3; with timing data, batches target batch_duration up to this limit)
+    #[arg(long, default_value_t = 0)]
     pub batch_size: usize,
 
-    /// Target batch duration in seconds (only used with timing cache)
-    #[arg(long, default_value_t = 3.0)]
+    /// Target batch duration in seconds (default: predicted_runtime/2; only used with timing cache)
+    #[arg(long, default_value_t = 0.0)]
     pub batch_duration: f64,
 
     /// Number of retries for failed tests
@@ -104,6 +104,12 @@ pub struct Args {
     /// Timeout per test batch in seconds (default: 600 = 10 minutes)
     #[arg(long, default_value_t = 600)]
     pub timeout: u64,
+
+    /// GPU stagger increment in milliseconds. The first N batches (N = jobs) will have
+    /// increasing amounts of CPU work at the start to stagger GPU test launches.
+    /// Batch 0 gets 1x this value, batch 1 gets 2x, etc. Set to 0 to disable.
+    #[arg(long, default_value_t = 100)]
+    pub gpu_stagger: u64,
 }
 
 // ============================================================================

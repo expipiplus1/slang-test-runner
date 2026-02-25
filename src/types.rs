@@ -338,6 +338,10 @@ pub struct TimingCache {
     /// Using String keys for JSON serialization compatibility
     #[serde(default)]
     pub timings_by_build: HashMap<String, HashMap<String, f64>>,
+    /// Map from build type to (test identifier -> ETA fudge factor)
+    /// Fudge factor = actual_elapsed / predicted_eta, used to correct displayed ETAs
+    #[serde(default)]
+    pub fudge_factors_by_build: HashMap<String, HashMap<String, f64>>,
     /// Legacy: flat timings map (for migration from version 2)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub timings: HashMap<String, f64>,
@@ -351,12 +355,15 @@ impl TimingCache {
                 if let Ok(mut cache) = serde_json::from_str::<TimingCache>(&contents) {
                     // Migrate from version 2 (flat timings) to version 3 (segmented)
                     if cache.version == 2 && !cache.timings.is_empty() {
-                        // Move old timings to "release" bucket as a reasonable default
                         cache.timings_by_build.insert("release".to_string(), cache.timings.clone());
                         cache.timings.clear();
-                        cache.version = 3;
+                        cache.version = 4;
                     }
-                    if cache.version >= 3 {
+                    // Migrate from version 3 to 4 (add fudge factors)
+                    if cache.version == 3 {
+                        cache.version = 4;
+                    }
+                    if cache.version >= 4 {
                         return cache;
                     }
                 }
@@ -364,8 +371,9 @@ impl TimingCache {
             }
         }
         Self {
-            version: 3,
+            version: 4,
             timings_by_build: HashMap::new(),
+            fudge_factors_by_build: HashMap::new(),
             timings: HashMap::new(),
         }
     }
@@ -424,6 +432,61 @@ impl TimingCache {
             self.record(build_type, test_id, *duration);
         }
     }
+
+    /// Get the fudge factors map for a specific build type
+    fn get_fudge_factors(&self, build_type: BuildType) -> Option<&HashMap<String, f64>> {
+        self.fudge_factors_by_build.get(&build_type.to_string())
+    }
+
+    /// Get or create the fudge factors map for a specific build type
+    fn get_fudge_factors_mut(&mut self, build_type: BuildType) -> &mut HashMap<String, f64> {
+        self.fudge_factors_by_build
+            .entry(build_type.to_string())
+            .or_insert_with(HashMap::new)
+    }
+
+    /// Record a fudge factor for a test. Uses EMA to smooth out variations.
+    pub fn record_fudge_factor(&mut self, build_type: BuildType, test_id: &str, fudge: f64) {
+        let factors = self.get_fudge_factors_mut(build_type);
+        let existing = factors.entry(test_id.to_string()).or_insert(1.0);
+        // EMA: weight new measurement, but be conservative (slower to change)
+        *existing = fudge * 0.3 + *existing * 0.7;
+    }
+
+    /// Get the average fudge factor for a set of tests.
+    /// Returns 1.0 if no fudge data is available.
+    pub fn average_fudge_factor(&self, build_type: BuildType, test_ids: &[String]) -> f64 {
+        let Some(factors) = self.get_fudge_factors(build_type) else {
+            return 1.0;
+        };
+
+        let mut sum = 0.0;
+        let mut count = 0;
+        for test_id in test_ids {
+            let timing_key = test_to_timing_key(test_id);
+            if let Some(&fudge) = factors.get(&timing_key) {
+                sum += fudge;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            sum / count as f64
+        } else {
+            1.0
+        }
+    }
+
+    /// Record fudge factors for all tests in a run.
+    /// fudge = actual_elapsed / predicted_eta
+    pub fn record_fudge_factors(&mut self, build_type: BuildType, test_ids: &[String], fudge: f64) {
+        // Clamp fudge factor to reasonable range (0.5x to 3x)
+        let clamped_fudge = fudge.clamp(0.5, 3.0);
+        for test_id in test_ids {
+            let timing_key = test_to_timing_key(test_id);
+            self.record_fudge_factor(build_type, &timing_key, clamped_fudge);
+        }
+    }
 }
 
 // ============================================================================
@@ -456,6 +519,14 @@ pub struct TestStats {
     pub compiling_since: Mutex<Option<Instant>>,
     /// Observed timings keyed by test identifier (e.g., "tests/foo.slang.4")
     pub observed_timings: Mutex<HashMap<String, f64>>,
+    /// Batch size histogram: maps batch_size -> count
+    pub batch_sizes: Mutex<HashMap<usize, usize>>,
+    /// Initial predicted ETA (for fudge factor calculation at end of run)
+    pub initial_predicted_eta: Mutex<Option<f64>>,
+    /// Start time of test execution (for fudge factor calculation)
+    pub execution_start_time: Mutex<Option<Instant>>,
+    /// List of test files in this run (for fudge factor recording)
+    pub test_files: Mutex<Vec<String>>,
 }
 
 impl TestStats {
@@ -505,6 +576,44 @@ impl TestStats {
 
     pub fn get_observed_timings(&self) -> HashMap<String, f64> {
         self.observed_timings.lock().unwrap().clone()
+    }
+
+    /// Record that a batch of a given size was executed
+    pub fn record_batch_size(&self, size: usize) {
+        let mut sizes = self.batch_sizes.lock().unwrap();
+        *sizes.entry(size).or_insert(0) += 1;
+    }
+
+    /// Get the batch size histogram
+    pub fn get_batch_sizes(&self) -> HashMap<usize, usize> {
+        self.batch_sizes.lock().unwrap().clone()
+    }
+
+    /// Record the initial predicted ETA and test files for fudge factor calculation
+    pub fn record_initial_prediction(&self, predicted_eta: f64, test_files: Vec<String>) {
+        *self.initial_predicted_eta.lock().unwrap() = Some(predicted_eta);
+        *self.execution_start_time.lock().unwrap() = Some(Instant::now());
+        *self.test_files.lock().unwrap() = test_files;
+    }
+
+    /// Calculate the fudge factor (actual_elapsed / predicted_eta)
+    /// Returns None if we don't have the necessary data
+    pub fn calculate_fudge_factor(&self) -> Option<f64> {
+        let predicted = (*self.initial_predicted_eta.lock().unwrap())?;
+        let start_time = (*self.execution_start_time.lock().unwrap())?;
+
+        // Only calculate if prediction was meaningful
+        if predicted < 1.0 {
+            return None;
+        }
+
+        let actual_elapsed = start_time.elapsed().as_secs_f64();
+        Some(actual_elapsed / predicted)
+    }
+
+    /// Get the test files from this run
+    pub fn get_test_files(&self) -> Vec<String> {
+        self.test_files.lock().unwrap().clone()
     }
 }
 
@@ -625,6 +734,7 @@ impl Scheduler {
         has_timing_data: bool,
         target_batch_duration: f64,
         gpu_jobs: Option<usize>,
+        gpu_stagger_ms: u64,
     ) -> (Self, SchedulerHandle) {
         let (tx, rx) = crossbeam_channel::unbounded();
 
@@ -632,7 +742,7 @@ impl Scheduler {
             .map(|f| predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
             .sum();
 
-        let batches = Self::build_batches(
+        let mut batches = Self::build_batches(
             files,
             &predictions,
             has_timing_data,
@@ -640,6 +750,11 @@ impl Scheduler {
             target_batch_duration,
             gpu_jobs,
         );
+
+        // Stagger GPU test starts in the first N batches to avoid Vulkan context contention
+        if gpu_stagger_ms > 0 {
+            Self::stagger_gpu_starts(&mut batches, num_workers, &predictions, gpu_stagger_ms);
+        }
 
         let predictions_arc = Arc::new(predictions.clone());
 
@@ -827,6 +942,55 @@ impl Scheduler {
         // and tail prioritization (in try_get_batch) to handle slow tests at the end.
         // Sorting by duration front-loads slow GPU tests, causing contention.
         batches
+    }
+
+    /// Stagger GPU test starts in the first N batches (N = num_workers).
+    ///
+    /// When all workers start simultaneously, they'd all hit GPU tests at once,
+    /// causing Vulkan context creation contention. This reorders tests within
+    /// the first N batches so each has an increasing CPU "prefix":
+    /// - Batch 0: ~stagger_ms of CPU tests first
+    /// - Batch 1: ~2*stagger_ms of CPU tests first
+    /// - Batch N-1: ~N*stagger_ms of CPU tests first
+    ///
+    /// This naturally staggers GPU test starts over ~N*stagger_ms instead of all at once.
+    fn stagger_gpu_starts(
+        batches: &mut Vec<BatchWithKind>,
+        num_workers: usize,
+        predictions: &HashMap<String, f64>,
+        stagger_increment_ms: u64,
+    ) {
+        for (batch_idx, batch) in batches.iter_mut().take(num_workers).enumerate() {
+            // Target CPU prefix duration increases with batch index
+            let target_cpu_prefix_secs = ((batch_idx + 1) * stagger_increment_ms as usize) as f64 / 1000.0;
+
+            // Partition tests into CPU and GPU
+            let (cpu_tests, gpu_tests): (Vec<_>, Vec<_>) = batch.tests
+                .drain(..)
+                .partition(|t| !is_gpu_test(t));
+
+            // Rebuild batch: CPU tests first (up to target), then GPU, then remaining CPU
+            let mut new_order = Vec::with_capacity(cpu_tests.len() + gpu_tests.len());
+            let mut cpu_prefix_duration = 0.0;
+            let mut remaining_cpu = Vec::new();
+
+            for test in cpu_tests {
+                let dur = predictions.get(&test).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                if cpu_prefix_duration < target_cpu_prefix_secs {
+                    new_order.push(test);
+                    cpu_prefix_duration += dur;
+                } else {
+                    remaining_cpu.push(test);
+                }
+            }
+
+            // Add GPU tests after the CPU prefix
+            new_order.extend(gpu_tests);
+            // Add remaining CPU tests at the end
+            new_order.extend(remaining_cpu);
+
+            batch.tests = new_order;
+        }
     }
 
     /// Add tests back to the pool (for retries or repooled tests after crash).
@@ -1191,10 +1355,12 @@ pub struct ProgressDisplay {
     sys: System,
     /// Counter for throttling system queries
     sys_query_counter: u32,
+    /// Fudge factor for ETA display (actual/predicted from historical runs)
+    eta_fudge_factor: f64,
 }
 
 impl ProgressDisplay {
-    pub fn new(total_files: usize, machine_output: bool, num_workers: usize, verbose: bool) -> Self {
+    pub fn new(total_files: usize, machine_output: bool, num_workers: usize, verbose: bool, eta_fudge_factor: f64) -> Self {
         let (multi_progress, main_progress_bar, worker_bars) = if machine_output {
             (None, None, Vec::new())
         } else {
@@ -1243,17 +1409,24 @@ impl ProgressDisplay {
             last_cpu_load: 0.0,
             sys: System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything())),
             sys_query_counter: 0,
+            eta_fudge_factor,
         }
     }
 
     pub fn update(&mut self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, has_pending_batches: bool, eta_seconds: Option<f64>, worker_states: Option<&WorkerStates>) {
-        // Update CPU/GPU load every ~30 updates (~500ms at 16ms refresh rate)
-        self.sys_query_counter += 1;
-        if self.sys_query_counter >= 30 {
-            self.sys_query_counter = 0;
-            self.last_cpu_load = get_cpu_usage(&mut self.sys);
-            self.last_gpu_load = get_gpu_usage();
+        // Update CPU/GPU load every ~30 updates (~500ms at 16ms refresh rate), only in verbose mode
+        if self.verbose {
+            self.sys_query_counter += 1;
+            if self.sys_query_counter >= 30 {
+                self.sys_query_counter = 0;
+                self.last_cpu_load = get_cpu_usage(&mut self.sys);
+                self.last_gpu_load = get_gpu_usage();
+            }
         }
+
+        // Apply fudge factor to ETA (historical actual/predicted ratio)
+        let adjusted_eta = eta_seconds.map(|eta| eta * self.eta_fudge_factor);
+
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
@@ -1279,7 +1452,7 @@ impl ProgressDisplay {
                 let new_marker = if at_99_pct { 99 } else { current_pct + 1 };
                 self.last_reported_files.store(new_marker, Ordering::SeqCst);
                 let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
-                let eta = match eta_seconds {
+                let eta = match adjusted_eta {
                     Some(secs) if secs > 1.0 => format!(" | ETA: {:.1}s", secs),
                     Some(_) => " | ETA: <1s".to_string(),
                     None => String::new(),
@@ -1294,8 +1467,8 @@ impl ProgressDisplay {
             // Percentage based on tests completed vs total
             let percent = (tests_done as f64 / self.total_files.max(1) as f64) * 100.0;
 
-            // Format ETA string
-            let eta = match eta_seconds {
+            // Format ETA string (velocity-adjusted)
+            let eta = match adjusted_eta {
                 Some(secs) if secs > 1.0 && tests_remaining > 0 => {
                     format!(" | ETA: {:.1}s", secs)
                 }
@@ -1321,10 +1494,14 @@ impl ProgressDisplay {
                 " \x1b[2m[no timer]\x1b[0m".to_string()
             };
 
-            let load_info = match self.last_gpu_load {
-                Some(gpu) => format!(" | CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
-                None if self.last_cpu_load > 0.0 => format!(" | CPU: {:.0}%", self.last_cpu_load),
-                None => String::new(),
+            let load_info = if self.verbose {
+                match self.last_gpu_load {
+                    Some(gpu) => format!(" | CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
+                    None if self.last_cpu_load > 0.0 => format!(" | CPU: {:.0}%", self.last_cpu_load),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
             };
 
             let msg = format!(

@@ -481,6 +481,7 @@ pub fn run_batch_with_pool(
     }
 
     ctx.running.fetch_add(1, Ordering::SeqCst);
+    ctx.stats.record_batch_size(ctx.test_files.len());
     let batch_start = Instant::now();
     let batch_id = std::thread::current().id();
     let file_info: Vec<_> = ctx.test_files.iter()
@@ -805,7 +806,7 @@ pub fn run_batch_with_pool(
         } else {
             format!(" {}", ctx.extra_args.join(" "))
         };
-        eprintln!("{}", format!("\nWARNING: Batch took {:.1}s", loop_time.as_secs_f64()).dimmed());
+        eprintln!("{}", format!("\nWARNING: Batch took {:.1}s (predicted {:.1}s)", loop_time.as_secs_f64(), total_pred).dimmed());
         eprintln!("{}", format!("  Reproduce: time {} {}{}",
             ctx.slang_test.display(),
             ctx.test_files.join(" "),
@@ -978,11 +979,22 @@ impl TestRunner {
             return;
         };
         let observed = self.stats.get_observed_timings();
+        let mut cache = self.timing_cache.lock().unwrap();
+
+        // Save observed timings
         if !observed.is_empty() {
-            let mut cache = self.timing_cache.lock().unwrap();
             cache.merge(build_type, &observed);
-            cache.save();
         }
+
+        // Calculate and save fudge factor for this run
+        if let Some(fudge) = self.stats.calculate_fudge_factor() {
+            let test_files = self.stats.get_test_files();
+            if !test_files.is_empty() {
+                cache.record_fudge_factors(build_type, &test_files, fudge);
+            }
+        }
+
+        cache.save();
     }
 
     pub fn run(&self) -> Result<bool> {
@@ -1181,6 +1193,25 @@ impl TestRunner {
                 .collect()
         };
 
+        // Compute effective batch_size and batch_duration (0 means auto-calculate)
+        // Use predicted parallel runtime (ETA) for batch duration, not total sequential time
+        let predicted_runtime = if has_timing_data {
+            calculate_initial_eta(&predictions, self.args.jobs, self.args.gpu_jobs)
+        } else {
+            // No timing data - estimate based on default duration
+            (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / self.args.jobs as f64
+        };
+        let effective_batch_size = if self.args.batch_size == 0 {
+            ((test_files.len() / self.args.jobs) * 3).max(1)
+        } else {
+            self.args.batch_size
+        };
+        let effective_batch_duration = if self.args.batch_duration == 0.0 {
+            (predicted_runtime / 2.0).max(1.0)
+        } else {
+            self.args.batch_duration
+        };
+
         // Constrained random shuffle: each test is randomly placed, but constrained
         // so it can't become the "long pole" at the end.
         //
@@ -1225,12 +1256,26 @@ impl TestRunner {
             files
         };
 
-        let eta = if has_timing_data {
+        // Calculate ETA and fudge factor for display
+        let raw_eta = if has_timing_data {
             Some(calculate_initial_eta(&predictions, self.args.jobs, self.args.gpu_jobs))
         } else {
             None
         };
-        let running_msg = format_running_message(test_files.len(), self.args.jobs, eta);
+
+        // Get historical fudge factor (average of all participating tests)
+        let fudge_factor = if has_timing_data {
+            let cache = self.timing_cache.lock().unwrap();
+            self.build_type
+                .map(|bt| cache.average_fudge_factor(bt, test_files))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+
+        // Apply fudge factor to displayed ETA
+        let display_eta = raw_eta.map(|eta| eta * fudge_factor);
+        let running_msg = format_running_message(test_files.len(), self.args.jobs, display_eta);
         if let Some(pb) = discovery_pb {
             pb.finish_with_message(running_msg);
         } else {
@@ -1238,15 +1283,31 @@ impl TestRunner {
             eprintln!("{}", running_msg);
         }
 
+        // Record initial prediction for fudge factor calculation at end of run
+        if let Some(eta) = raw_eta {
+            self.stats.record_initial_prediction(eta, test_files.to_vec());
+        }
+
+        if self.args.verbose {
+            eprintln!(
+                "{}",
+                format!(
+                    "Batch config: max_size={}, max_duration={:.1}s",
+                    effective_batch_size, effective_batch_duration
+                ).dimmed()
+            );
+        }
+
         // Create scheduler and handle (message-passing architecture)
         let (mut scheduler, scheduler_handle) = Scheduler::new(
             sorted_files,
-            self.args.batch_size,
+            effective_batch_size,
             self.args.jobs,
             predictions,
             has_timing_data,
-            self.args.batch_duration,
+            effective_batch_duration,
             self.args.gpu_jobs,
+            self.args.gpu_stagger,
         );
 
         let stats = self.stats.clone();
@@ -1294,8 +1355,9 @@ impl TestRunner {
         let num_workers = self.args.jobs;
         let progress_worker_states = worker_states.clone();
         let verbose_for_progress = self.args.verbose;
+        let progress_fudge_factor = fudge_factor;
         let progress_handle = thread::spawn(move || {
-            let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose_for_progress);
+            let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose_for_progress, progress_fudge_factor);
             let mut sys_stats: Option<SystemStats> = None;
             let mut stats_counter = 0u32;
             while !progress_shutdown_clone.load(Ordering::SeqCst) {
@@ -1738,6 +1800,13 @@ impl TestRunner {
                     }
                 }
             }
+
+            // Batch size histogram
+            let batch_sizes = self.stats.get_batch_sizes();
+            if !batch_sizes.is_empty() {
+                println!("\n{}:", "Batch size distribution".yellow());
+                self.print_batch_histogram(&batch_sizes);
+            }
         }
 
         if !failures.is_empty() {
@@ -1773,5 +1842,48 @@ impl TestRunner {
         }
 
         println!("{}", "=".repeat(70));
+    }
+
+    /// Print a unicode histogram of batch sizes using braille characters
+    fn print_batch_histogram(&self, batch_sizes: &HashMap<usize, usize>) {
+        if batch_sizes.is_empty() {
+            return;
+        }
+
+        // Get sorted sizes and find max count for scaling
+        let mut sizes: Vec<_> = batch_sizes.iter().collect();
+        sizes.sort_by_key(|(size, _)| *size);
+
+        let max_count = *sizes.iter().map(|(_, count)| *count).max().unwrap_or(&1);
+        let total_batches: usize = sizes.iter().map(|(_, count)| **count).sum();
+
+        // Braille characters for smooth partial fills (8 levels + empty)
+        // Fills left column bottom-to-top, then right column bottom-to-top
+        const BRAILLE: [char; 9] = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿'];
+        const BAR_WIDTH: usize = 30;
+
+        for (size, count) in &sizes {
+            // Calculate bar length (fractional)
+            let ratio = **count as f64 / max_count as f64;
+            let full_chars = (ratio * BAR_WIDTH as f64) as usize;
+            let partial = ((ratio * BAR_WIDTH as f64 - full_chars as f64) * 8.0) as usize;
+
+            // Build the bar
+            let mut bar = String::new();
+            for _ in 0..full_chars {
+                bar.push('⣿');
+            }
+            if full_chars < BAR_WIDTH {
+                bar.push(BRAILLE[partial.min(8)]);
+                for _ in (full_chars + 1)..BAR_WIDTH {
+                    bar.push('⠀');
+                }
+            }
+
+            let pct = (**count as f64 / total_batches as f64) * 100.0;
+            println!("  {:>3} tests │{}│ {:>4} ({:>4.1}%)", size, bar, count, pct);
+        }
+
+        println!("  {:>10} {:>32} batches", "", total_batches);
     }
 }
