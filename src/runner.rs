@@ -13,6 +13,22 @@ use std::time::{Duration, Instant};
 use crate::types::{*, TestId, test_to_timing_key};
 
 // ============================================================================
+// Debug Logging
+// ============================================================================
+
+static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("STI_DEBUG").is_ok());
+static DEBUG_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Print a debug message with timestamp, only if STI_DEBUG is set
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if *DEBUG_ENABLED {
+            eprintln!("{}", format!("[DEBUG {:>6.3}s] {}", DEBUG_START.elapsed().as_secs_f64(), format!($($arg)*)).dimmed());
+        }
+    };
+}
+
+// ============================================================================
 // ETA Calculation and Display
 // ============================================================================
 
@@ -1061,8 +1077,7 @@ impl TestRunner {
         // Mark execution started so progress display can show "waiting for output"
         stats.mark_execution_started();
 
-        let debug_start = Instant::now();
-        eprintln!("[DEBUG {:>6.3}s] about to spawn progress thread", debug_start.elapsed().as_secs_f64());
+        debug_log!("about to spawn progress thread");
 
         // Spawn progress thread first
         let progress_stats = stats.clone();
@@ -1102,12 +1117,12 @@ impl TestRunner {
             }
         });
 
-        eprintln!("[DEBUG {:>6.3}s] progress thread spawned, about to spawn workers", debug_start.elapsed().as_secs_f64());
+        debug_log!("progress thread spawned, about to spawn workers");
 
         // Spawn worker threads
         if !work_pool.is_empty() {
             for i in 0..self.args.jobs {
-                eprintln!("[DEBUG {:>6.3}s] spawning worker {}", debug_start.elapsed().as_secs_f64(), i);
+                debug_log!("spawning worker {}", i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                 let root_dir = self.args.root_dir.clone();
                 let extra_args = self.args.extra_args.clone();
@@ -1121,9 +1136,8 @@ impl TestRunner {
                 let verbose = self.args.verbose;
 
                 let worker_id = i;
-                let worker_debug_start = debug_start;
                 let handle = thread::spawn(move || {
-                    eprintln!("[DEBUG {:>6.3}s] worker {} started, getting first batch", worker_debug_start.elapsed().as_secs_f64(), worker_id);
+                    debug_log!("worker {} started, getting first batch", worker_id);
                     loop {
                         if shutdown.load(Ordering::SeqCst) || is_interrupted() {
                             break;
@@ -1133,9 +1147,9 @@ impl TestRunner {
                         if let Some(batch) = pool.try_get_batch() {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
-                                eprintln!("[DEBUG {:>6.3}s] worker {} try_get_batch took {:.3}s", worker_debug_start.elapsed().as_secs_f64(), worker_id, get_batch_time.as_secs_f64());
+                                debug_log!("worker {} try_get_batch took {:.3}s", worker_id, get_batch_time.as_secs_f64());
                             }
-                            eprintln!("[DEBUG {:>6.3}s] worker {} got batch of {} tests", worker_debug_start.elapsed().as_secs_f64(), worker_id, batch.len());
+                            debug_log!("worker {} got batch of {} tests", worker_id, batch.len());
                             run_batch_with_pool(
                                 &slang_test,
                                 &root_dir,
@@ -1159,7 +1173,7 @@ impl TestRunner {
                 handles.push(handle);
             }
 
-            eprintln!("[DEBUG {:>6.3}s] all workers spawned, entering main loop", debug_start.elapsed().as_secs_f64());
+            debug_log!("all workers spawned, entering main loop");
 
             let adaptive = self.args.adaptive;
             let num_cpus = self.args.jobs;
