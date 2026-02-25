@@ -535,6 +535,15 @@ struct BatchWithKind {
     kind: BatchKind,
 }
 
+/// Work pool for distributing test batches to workers.
+///
+/// LOCK ORDERING: To avoid deadlocks, locks must always be acquired in this order:
+///   1. pending_files
+///   2. batches
+///   3. pool_predicted
+///   4. in_flight
+///
+/// Any method acquiring multiple locks must follow this order.
 pub struct WorkPool {
     /// Pre-built batches of tests, ready to be popped by workers
     batches: Mutex<Vec<BatchWithKind>>,
@@ -723,26 +732,49 @@ impl WorkPool {
     /// This triggers a rebuild of batches on the next try_get_batch call.
     pub fn add_file(&self, file: String) {
         let predicted = self.predictions.get(&file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+        // Lock order must match try_get_batch: pending_files first, then pool_predicted
+        let mut pending = self.pending_files.lock().unwrap();
         *self.pool_predicted.lock().unwrap() += predicted;
-        self.pending_files.lock().unwrap().push(file);
+        pending.push(file);
     }
 
+    /// Check if the pool is empty.
+    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
     pub fn is_empty(&self) -> bool {
-        self.batches.lock().unwrap().is_empty()
-            && self.pending_files.lock().unwrap().is_empty()
-            && self.in_flight.lock().unwrap().is_empty()
+        // Lock in same order as try_get_batch to avoid deadlock
+        let pending = self.pending_files.lock().unwrap();
+        let batches = self.batches.lock().unwrap();
+        let in_flight = self.in_flight.lock().unwrap();
+        pending.is_empty() && batches.is_empty() && in_flight.is_empty()
+    }
+
+    /// Get debug info about pool state: (batches_count, pending_count, in_flight_ids)
+    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
+    pub fn debug_state(&self) -> (usize, usize, Vec<usize>) {
+        // Lock in same order as try_get_batch to avoid deadlock
+        let pending = self.pending_files.lock().unwrap();
+        let batches = self.batches.lock().unwrap();
+        let in_flight = self.in_flight.lock().unwrap();
+        (
+            batches.len(),
+            pending.len(),
+            in_flight.keys().copied().collect(),
+        )
     }
 
     /// Check if there are batches waiting to be picked up (excluding in-flight)
+    /// IMPORTANT: Lock order must be pending_files -> batches (same as try_get_batch)
     pub fn has_pending_batches(&self) -> bool {
-        !self.batches.lock().unwrap().is_empty()
-            || !self.pending_files.lock().unwrap().is_empty()
+        let pending = self.pending_files.lock().unwrap();
+        let batches = self.batches.lock().unwrap();
+        !pending.is_empty() || !batches.is_empty()
     }
 
     /// Returns number of tests remaining (in pool + in-flight)
+    /// IMPORTANT: Lock order must be pending_files -> batches -> in_flight (same as try_get_batch)
     pub fn remaining(&self) -> usize {
-        let batches = self.batches.lock().unwrap();
         let pending = self.pending_files.lock().unwrap();
+        let batches = self.batches.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap();
         let pool_count: usize = batches.iter().map(|b| b.tests.len()).sum::<usize>() + pending.len();
         let in_flight_count: usize = in_flight.values().map(|b| b.test_count).sum();

@@ -20,11 +20,18 @@ use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates};
 static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("STI_DEBUG").is_ok());
 static DEBUG_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Print a debug message with timestamp, only if STI_DEBUG is set
+/// Print a debug message with timestamp and thread ID, only if STI_DEBUG is set
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if *DEBUG_ENABLED {
-            eprintln!("{}", format!("[DEBUG {:>6.3}s] {}", DEBUG_START.elapsed().as_secs_f64(), format!($($arg)*)).dimmed());
+            let thread_id = std::thread::current().id();
+            let thread_name = std::thread::current().name().unwrap_or("?").to_string();
+            eprintln!("{}", format!("[DEBUG {:>6.3}s] [{}:{}] {}",
+                DEBUG_START.elapsed().as_secs_f64(),
+                thread_name,
+                format!("{:?}", thread_id).trim_start_matches("ThreadId(").trim_end_matches(")"),
+                format!($($arg)*)
+            ).dimmed());
         }
     };
 }
@@ -121,7 +128,10 @@ pub fn is_interrupted() -> bool {
 }
 
 pub fn set_interrupted() {
-    INTERRUPTED.store(true, Ordering::SeqCst);
+    if INTERRUPTED.swap(true, Ordering::SeqCst) {
+        std::process::exit(130);
+    }
+    eprintln!("\nInterrupt received (Ctrl-C)");
 }
 
 /// Format exit status in a platform-appropriate way
@@ -524,13 +534,21 @@ pub fn run_batch_with_pool(
         .stdout(pipe_writer)
         .stderr(pipe_writer2);
 
+    debug_log!("spawning slang-test for {} tests", ctx.test_files.len());
     let mut child = match cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => {
+            debug_log!("slang-test spawned successfully");
+            child
+        }
         Err(e) => {
             eprintln!("ERROR: Failed to spawn slang-test: {}", e);
             return;
         }
     };
+
+    // IMPORTANT: Drop the Command to close the pipe writers in the parent process.
+    // Otherwise the pipe reader will never get EOF when the child dies.
+    drop(cmd);
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
     let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>(); // (test_id, duration)
@@ -540,16 +558,20 @@ pub fn run_batch_with_pool(
     let machine_output_for_stderr = ctx.machine_output;
 
     // Single reader thread for combined stdout/stderr
-    let output_handle = thread::spawn(move || {
+    let output_handle = thread::Builder::new()
+        .name("output-reader".to_string())
+        .spawn(move || {
         let reader = BufReader::new(pipe_reader);
 
         let mut last_test_time: Option<Instant> = None;
         // Accumulate lines between test results - these are failure details
         let mut pending_output: Vec<String> = Vec::new();
-        // Track if we've seen any test result yet (to skip initial slang-test spiel)
-        let mut seen_first_test = false;
+        // Track if we've finished the initial slang-test spew (Supported backends, Check lines)
+        let mut past_initial_spew = false;
+        let mut lines_read = 0;
 
         for line in reader.lines() {
+            lines_read += 1;
             if is_interrupted() {
                 break;
             }
@@ -583,6 +605,13 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
+                // Detect end of initial spew - test output starts with [test_name] or error markers
+                if !past_initial_spew {
+                    if line.starts_with('[') || line.contains("EXPECTED{{{") || line.contains("ACTUAL{{{") {
+                        past_initial_spew = true;
+                    }
+                }
+
                 // Try to parse as test result line
                 if let Some(mut outcome) = parse_test_output(&line) {
                     let now = Instant::now();
@@ -603,14 +632,14 @@ pub fn run_batch_with_pool(
                     last_test_time = Some(now);
 
                     // Attach accumulated output to this outcome (failure details come before the FAILED line)
-                    if outcome.result == TestResult::Failed && seen_first_test {
+                    if outcome.result == TestResult::Failed {
                         outcome.failure_output = std::mem::take(&mut pending_output);
                     } else {
                         // Clear pending output for passed/ignored tests
                         pending_output.clear();
                     }
 
-                    seen_first_test = true;
+                    past_initial_spew = true;
 
                     // Extract the timing key
                     let test_id = TestId::parse(&outcome.name);
@@ -621,15 +650,16 @@ pub fn run_batch_with_pool(
                     }
 
                     let _ = outcome_tx.send(outcome);
-                } else if seen_first_test {
+                } else if past_initial_spew {
                     // Accumulate non-result lines (failure details, error messages)
-                    // Only after we've seen the first test to skip initial slang-test output
+                    // Only after we've passed the initial slang-test spew
                     pending_output.push(line);
                 }
             }
         }
         let _ = compiling_tx.send(false);
-    });
+        debug_log!("output reader exiting after {} lines", lines_read);
+    }).expect("failed to spawn output reader thread");
 
     let mut failed_outcomes: Vec<TestOutcome> = Vec::new();
     let start = Instant::now();
@@ -640,9 +670,12 @@ pub fn run_batch_with_pool(
     let mut seen_tests: HashSet<String> = HashSet::new();
     let expected_test_count = ctx.test_files.len();
 
+    let mut need_kill = false;
+    debug_log!("entering batch monitor loop, expecting {} tests", expected_test_count);
     loop {
         if is_interrupted() {
-            let _ = child.kill();
+            debug_log!("batch monitor: interrupted");
+            need_kill = true;
             break;
         }
 
@@ -654,7 +687,8 @@ pub fn run_batch_with_pool(
         }
 
         if is_compiling_core() && !this_batch_is_compiling {
-            let _ = child.kill();
+            debug_log!("batch monitor: killing for compilation");
+            need_kill = true;
             killed_for_compilation = true;
             break;
         }
@@ -695,33 +729,47 @@ pub fn run_batch_with_pool(
         // Check if we've seen all expected tests - no need to wait for slang-test
         // With shared stdout/stderr pipe, failure output comes before next test result
         if seen_tests.len() >= expected_test_count {
-            reap_process(child);
+            debug_log!("batch monitor: all {} tests seen", expected_test_count);
             break;
         }
 
         // Check if output is complete (saw summary or "no tests run")
-        // Don't wait for process exit - send to reaper and continue immediately
         if done_rx.try_recv().is_ok() {
-            reap_process(child);
+            debug_log!("batch monitor: done signal received");
             break;
         }
 
         match child.try_wait() {
             Ok(Some(status)) => {
+                debug_log!("batch monitor: child exited with {:?}, seen {}/{} tests",
+                    status, seen_tests.len(), expected_test_count);
                 exit_status = Some(status);
                 break;
             }
             Ok(None) => {
                 if start.elapsed() > ctx.timeout {
-                    let _ = child.kill();
+                    debug_log!("batch monitor: timeout after {}s", ctx.timeout.as_secs());
+                    need_kill = true;
                     killed_for_timeout = true;
                     break;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => break,
+            Err(e) => {
+                debug_log!("batch monitor: try_wait error: {}", e);
+                break;
+            }
         }
     }
+    debug_log!("batch monitor loop exited: need_kill={} seen={}/{}", need_kill, seen_tests.len(), expected_test_count);
+
+    // Clean up the child process
+    if need_kill {
+        debug_log!("killing child process");
+        let _ = child.kill();
+    }
+    debug_log!("sending child to reaper");
+    reap_process(child);
 
     let loop_time = start.elapsed();
     if ctx.verbose && loop_time.as_secs() > 30 {
@@ -738,15 +786,8 @@ pub fn run_batch_with_pool(
         ).dimmed());
     }
 
-    while let Ok((test_id, duration)) = timing_rx.try_recv() {
-        ctx.stats.record_observed_timing(&test_id, duration);
-    }
-
-    while let Ok(outcome) = outcome_rx.try_recv() {
-        process_outcome(outcome, &ctx, &mut failed_outcomes);
-    }
-
     if killed_for_compilation {
+        debug_log!("killed for compilation, repooling {} tests", ctx.test_files.len());
         // Clear worker state before returning
         if let Some(state) = worker_state {
             state.clear();
@@ -754,17 +795,40 @@ pub fn run_batch_with_pool(
         for file in ctx.test_files {
             ctx.work_pool.add_file(file.to_string());
         }
+        debug_log!("waiting for core compilation to complete");
         while is_compiling_core() && !is_interrupted() {
             thread::sleep(Duration::from_millis(50));
         }
+        debug_log!("core compilation wait finished");
         return;
     }
 
-    // Don't join output thread - it'll finish on its own
-    // We already have all the data we need via channels
-    drop(output_handle);
+    // Drain remaining outcomes from the channel.
+    // The output thread will close the channel when it exits (after EOF on pipe).
+    // We join the output thread to ensure we get all outcomes before proceeding.
+    debug_log!("drain: joining output thread");
+    let join_result = output_handle.join();
+    debug_log!("drain: output thread joined with result {:?}", join_result.is_ok());
 
-    // Detect crash or timeout: if we didn't see all tests and weren't interrupted/killed for compilation
+    // Now drain any remaining items from the channels (they're closed, so this is non-blocking)
+    debug_log!("drain: draining remaining outcomes");
+    let mut drained_count = 0;
+    while let Ok(outcome) = outcome_rx.try_recv() {
+        debug_log!("drain: got outcome {}", outcome.name);
+        drained_count += 1;
+
+        // Track seen tests for crash detection
+        let test_id = TestId::parse(&outcome.name);
+        seen_tests.insert(test_id.to_timing_key());
+
+        process_outcome(outcome, &ctx, &mut failed_outcomes);
+    }
+    debug_log!("drain: drained {} outcomes", drained_count);
+    // Final drain of timing channel
+    while let Ok((test_id, duration)) = timing_rx.try_recv() {
+        ctx.stats.record_observed_timing(&test_id, duration);
+    }
+
     let all_tests_seen = seen_tests.len() >= expected_test_count;
     if !all_tests_seen && !is_interrupted() && !killed_for_compilation {
         let exit_info = if killed_for_timeout {
@@ -790,6 +854,9 @@ pub fn run_batch_with_pool(
             // Test caused the crash/timeout - blame the first unaccounted test, repool the rest
             let crashed_test = unaccounted_tests.first().cloned();
             let tests_to_repool: Vec<String> = unaccounted_tests.iter().skip(1).cloned().collect();
+
+            debug_log!("test-caused crash, blaming {:?}, repooling {} tests",
+                crashed_test, tests_to_repool.len());
 
             for test in &tests_to_repool {
                 ctx.work_pool.add_file(test.clone());
@@ -825,8 +892,10 @@ pub fn run_batch_with_pool(
             }
         } else {
             // External kill (SIGTERM, SIGKILL, taskkill) - repool ALL unaccounted tests
+            debug_log!("external kill detected, repooling all {} unaccounted tests", unaccounted_tests.len());
+            // Clear current line (progress bar) before printing
             eprintln!(
-                "\n{}",
+                "\r\x1b[K{}",
                 format!("slang-test killed externally ({}), repooling {} tests",
                     exit_info, unaccounted_tests.len()).dimmed()
             );
@@ -1221,11 +1290,18 @@ impl TestRunner {
                 let worker_states_clone = worker_states.clone();
 
                 let worker_id = i;
-                let handle = thread::spawn(move || {
-                    debug_log!("worker {} started, getting first batch", worker_id);
+                let handle = thread::Builder::new()
+                    .name(format!("worker-{}", worker_id))
+                    .spawn(move || {
+                    debug_log!("started, getting first batch");
                     let my_state = worker_states_clone.as_ref().map(|ws| ws.get(worker_id));
                     loop {
-                        if shutdown.load(Ordering::SeqCst) || is_interrupted() {
+                        if shutdown.load(Ordering::SeqCst) {
+                            debug_log!("shutdown flag set, exiting");
+                            break;
+                        }
+                        if is_interrupted() {
+                            debug_log!("interrupted, exiting");
                             break;
                         }
 
@@ -1233,12 +1309,12 @@ impl TestRunner {
                         let has_gpu_slot = pool.can_take_gpu_batch();
 
                         let get_batch_start = Instant::now();
-                        if let Some((batch_id, batch, _kind)) = pool.try_get_batch(has_gpu_slot) {
+                        if let Some((batch_id, batch, kind)) = pool.try_get_batch(has_gpu_slot) {
                             let get_batch_time = get_batch_start.elapsed();
                             if get_batch_time.as_millis() > 10 {
-                                debug_log!("worker {} try_get_batch took {:.3}s", worker_id, get_batch_time.as_secs_f64());
+                                debug_log!("try_get_batch took {:.3}s", get_batch_time.as_secs_f64());
                             }
-                            debug_log!("worker {} got batch of {} tests", worker_id, batch.len());
+                            debug_log!("got batch {} of {} tests ({:?})", batch_id, batch.len(), kind);
                             run_batch_with_pool(
                                 &slang_test,
                                 &root_dir,
@@ -1255,27 +1331,57 @@ impl TestRunner {
                                 verbose,
                                 my_state,
                             );
+                            debug_log!("batch {} completed, calling complete_batch", batch_id);
                             pool.complete_batch(batch_id);
+                            debug_log!("batch {} complete_batch done", batch_id);
                         } else {
+                            // No batch available - log why and wait
+                            let (batches_count, pending_count, in_flight_ids) = pool.debug_state();
+                            debug_log!("no batch available: batches={} pending={} in_flight={:?} has_gpu_slot={}",
+                                batches_count, pending_count, in_flight_ids, has_gpu_slot);
                             thread::sleep(Duration::from_millis(10));
                         }
                     }
-                });
+                    debug_log!("worker loop exited");
+                }).expect("failed to spawn worker thread");
                 handles.push(handle);
             }
 
             debug_log!("all workers spawned, entering main loop");
 
-            while !work_pool.is_empty() || running.load(Ordering::SeqCst) > 0 {
-                if is_interrupted() {
+            loop {
+                let pool_empty = work_pool.is_empty();
+                let running_count = running.load(Ordering::SeqCst);
+
+                if pool_empty && running_count == 0 {
+                    debug_log!("main loop: pool empty and no batches running, exiting");
                     break;
                 }
+
+                if is_interrupted() {
+                    debug_log!("main loop: interrupted, exiting");
+                    break;
+                }
+
+                // Log state periodically (every ~1 second when DEBUG is on)
+                static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now_ms = DEBUG_START.elapsed().as_millis() as u64;
+                let last = LAST_LOG.load(Ordering::Relaxed);
+                if now_ms - last > 1000 {
+                    LAST_LOG.store(now_ms, Ordering::Relaxed);
+                    let (batches_count, pending_count, in_flight_ids) = work_pool.debug_state();
+                    debug_log!("main loop: running={} batches={} pending={} in_flight={:?}",
+                        running_count, batches_count, pending_count, in_flight_ids);
+                }
+
                 thread::sleep(Duration::from_millis(20));
             }
 
+            debug_log!("main loop exited, setting shutdown flag");
             shutdown.store(true, Ordering::SeqCst);
 
             // Don't wait for workers - they'll exit on their own when they see shutdown
+            debug_log!("dropping worker handles");
             drop(handles);
 
             progress_shutdown.store(true, Ordering::SeqCst);
