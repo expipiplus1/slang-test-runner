@@ -356,6 +356,14 @@ fn main() -> Result<()> {
 
     let mut args = Args::parse();
 
+    // Validate job counts
+    if args.jobs == 0 {
+        anyhow::bail!("-j/--jobs must be at least 1");
+    }
+    if args.gpu_jobs == Some(0) {
+        anyhow::bail!("-g/--gpu-jobs must be at least 1");
+    }
+
     // Validate API filter combinations
     if !args.apis.is_empty() && !args.ignore_apis.is_empty() {
         // Check for overlap - it's nonsense to both include and exclude the same API
