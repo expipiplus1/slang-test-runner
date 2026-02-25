@@ -360,26 +360,6 @@ fn process_outcome(
     }
 }
 
-fn collect_failure_output(failed_outcomes: &mut [TestOutcome], stderr_lines: &[String]) {
-    for outcome in failed_outcomes.iter_mut() {
-        let test_prefix = format!("[{}]", outcome.name);
-        let mut capture = false;
-        let mut relevant_lines: Vec<String> = Vec::new();
-
-        for line in stderr_lines {
-            if line.starts_with(&test_prefix) {
-                capture = true;
-            }
-            if capture {
-                relevant_lines.push(line.clone());
-                if line.contains("}}}") && relevant_lines.iter().filter(|l| l.contains("}}}")).count() >= 2 {
-                    break;
-                }
-            }
-        }
-        outcome.failure_output = relevant_lines;
-    }
-}
 
 // ============================================================================
 // Batch Execution
@@ -512,7 +492,6 @@ pub fn run_batch_with_pool(
     };
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
-    let (stderr_tx, stderr_rx) = crossbeam_channel::unbounded::<String>();
     let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>(); // (test_id, duration)
     let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1); // Signal when output is complete
     let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
@@ -524,6 +503,10 @@ pub fn run_batch_with_pool(
         let reader = BufReader::new(pipe_reader);
 
         let mut last_test_time: Option<Instant> = None;
+        // Accumulate lines between test results - these are failure details
+        let mut pending_output: Vec<String> = Vec::new();
+        // Track if we've seen any test result yet (to skip initial slang-test spiel)
+        let mut seen_first_test = false;
 
         for line in reader.lines() {
             if is_interrupted() {
@@ -550,6 +533,7 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
+                // Skip slang-test initial output (before any tests run)
                 if line.starts_with("Supported backends:")
                     || line.starts_with("Check ")
                     || line.starts_with("Retrying ")
@@ -558,12 +542,11 @@ pub fn run_batch_with_pool(
                     continue;
                 }
 
-                // Try to parse as test output
+                // Try to parse as test result line
                 if let Some(mut outcome) = parse_test_output(&line) {
                     let now = Instant::now();
 
                     // Record timing for all test results (passed, failed, ignored)
-                    // since they all contribute to overall runtime
                     let test_duration = if last_test_time.is_some() {
                         outcome.duration
                             .map(|d| d.as_secs_f64())
@@ -578,8 +561,17 @@ pub fn run_batch_with_pool(
 
                     last_test_time = Some(now);
 
-                    // Extract the timing key: base file path + variant suffix (no backend/syn suffix)
-                    // e.g., "tests/foo.slang.4 syn (vk)" -> "tests/foo.slang.4"
+                    // Attach accumulated output to this outcome (failure details come before the FAILED line)
+                    if outcome.result == TestResult::Failed && seen_first_test {
+                        outcome.failure_output = std::mem::take(&mut pending_output);
+                    } else {
+                        // Clear pending output for passed/ignored tests
+                        pending_output.clear();
+                    }
+
+                    seen_first_test = true;
+
+                    // Extract the timing key
                     let test_id = TestId::parse(&outcome.name);
                     let timing_key = test_id.to_timing_key();
 
@@ -588,9 +580,10 @@ pub fn run_batch_with_pool(
                     }
 
                     let _ = outcome_tx.send(outcome);
-                } else {
-                    // Not a test result - must be stderr output (error details, etc.)
-                    let _ = stderr_tx.send(line);
+                } else if seen_first_test {
+                    // Accumulate non-result lines (failure details, error messages)
+                    // Only after we've seen the first test to skip initial slang-test output
+                    pending_output.push(line);
                 }
             }
         }
@@ -730,8 +723,6 @@ pub fn run_batch_with_pool(
     // We already have all the data we need via channels
     drop(output_handle);
 
-    let stderr_lines: Vec<String> = stderr_rx.try_iter().collect();
-
     // Report any tests that weren't accounted for in the output
     if !is_interrupted() && !killed_for_compilation {
         let mut unaccounted: Vec<&String> = Vec::new();
@@ -816,8 +807,6 @@ pub fn run_batch_with_pool(
             ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
         }
     }
-
-    collect_failure_output(&mut failed_outcomes, &stderr_lines);
 
     for outcome in failed_outcomes {
         let info = parse_failure_info(&outcome.name, &outcome.failure_output);
@@ -1294,9 +1283,6 @@ impl TestRunner {
                     println!("{}{}", indent2, line.dimmed());
                 }
             }
-            if expected.lines().count() > 10 {
-                println!("{}(truncated) ...", indent2);
-            }
             return;
         }
 
@@ -1307,31 +1293,24 @@ impl TestRunner {
                 } else {
                     println!("{}{}:", indent, "Expected".green());
                 }
-                for line in expected.lines().take(20) {
+                for line in expected.lines() {
                     if self.machine_output {
                         println!("{}", line);
                     } else {
                         println!("{}{}", indent2, line.green());
                     }
                 }
-                if expected.lines().count() > 20 {
-                    println!("{}(truncated) ...", indent2);
-                }
-
                 if self.machine_output {
                     println!("Actual:");
                 } else {
                     println!("{}{}:", indent, "Actual".red());
                 }
-                for line in actual.lines().take(20) {
+                for line in actual.lines() {
                     if self.machine_output {
                         println!("{}", line);
                     } else {
                         println!("{}{}", indent2, line.red());
                     }
-                }
-                if actual.lines().count() > 20 {
-                    println!("{}(truncated) ...", indent2);
                 }
             }
             "difft" => {
@@ -1344,12 +1323,22 @@ impl TestRunner {
     }
 
     fn run_external_diff(&self, cmd: &str, args: &[&str], expected: &str, actual: &str) {
+        print!("{}", Self::compute_external_diff(cmd, args, expected, actual, self.machine_output));
+    }
+
+    /// Compute diff output as a string (can be run in parallel)
+    fn compute_external_diff(cmd: &str, args: &[&str], expected: &str, actual: &str, machine_output: bool) -> String {
         use std::io::Write as _;
 
-        let indent = if self.machine_output { "" } else { "  " };
+        let indent = if machine_output { "" } else { "  " };
 
-        let expected_file = std::env::temp_dir().join("slang-test-expected.txt");
-        let actual_file = std::env::temp_dir().join("slang-test-actual.txt");
+        // Use unique temp files for parallel safety
+        let id = std::process::id();
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let expected_file = std::env::temp_dir().join(format!("slang-test-expected-{}-{}.txt", id, thread_id.replace(|c: char| !c.is_alphanumeric(), "")));
+        let actual_file = std::env::temp_dir().join(format!("slang-test-actual-{}-{}.txt", id, thread_id.replace(|c: char| !c.is_alphanumeric(), "")));
+
+        let mut result = String::new();
 
         if let (Ok(mut ef), Ok(mut af)) = (
             std::fs::File::create(&expected_file),
@@ -1368,28 +1357,28 @@ impl TestRunner {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     for line in stdout.lines() {
-                        println!("{}{}", indent, line);
+                        result.push_str(&format!("{}{}\n", indent, line));
                     }
                 }
                 Err(_) => {
-                    println!("{}({} not available, showing raw output)", indent, cmd);
-                    if self.machine_output {
-                        println!("Expected:");
-                        for line in expected.lines().take(20) {
-                            println!("{}", line);
+                    result.push_str(&format!("{}({} not available, showing raw output)\n", indent, cmd));
+                    if machine_output {
+                        result.push_str("Expected:\n");
+                        for line in expected.lines() {
+                            result.push_str(&format!("{}\n", line));
                         }
-                        println!("Actual:");
-                        for line in actual.lines().take(20) {
-                            println!("{}", line);
+                        result.push_str("Actual:\n");
+                        for line in actual.lines() {
+                            result.push_str(&format!("{}\n", line));
                         }
                     } else {
-                        println!("{}{}:", indent, "Expected".green());
-                        for line in expected.lines().take(20) {
-                            println!("    {}", line.green());
+                        result.push_str(&format!("{}Expected:\n", indent));
+                        for line in expected.lines() {
+                            result.push_str(&format!("    {}\n", line));
                         }
-                        println!("{}{}:", indent, "Actual".red());
-                        for line in actual.lines().take(20) {
-                            println!("    {}", line.red());
+                        result.push_str(&format!("{}Actual:\n", indent));
+                        for line in actual.lines() {
+                            result.push_str(&format!("    {}\n", line));
                         }
                     }
                 }
@@ -1398,6 +1387,8 @@ impl TestRunner {
             let _ = std::fs::remove_file(&expected_file);
             let _ = std::fs::remove_file(&actual_file);
         }
+
+        result
     }
 
     fn print_summary(&self, elapsed: Duration) {
@@ -1416,11 +1407,51 @@ impl TestRunner {
             let mut sorted_failures: Vec<_> = failures.iter().collect();
             sorted_failures.sort_by(|a, b| a.test_name.cmp(&b.test_name));
 
-            for failure in &sorted_failures {
+            // Pre-compute diffs in parallel for failures that have expected/actual
+            let diff_tool = self.args.diff.as_str();
+            let machine_output = self.machine_output;
+            let diff_results: Vec<Option<String>> = if diff_tool != "none" {
+                let handles: Vec<_> = sorted_failures
+                    .iter()
+                    .map(|failure| {
+                        if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
+                            let expected = expected.clone();
+                            let actual = actual.clone();
+                            let tool = diff_tool.to_string();
+                            Some(thread::spawn(move || {
+                                let (cmd, args): (&str, &[&str]) = if tool == "difft" {
+                                    ("difft", &["--color", "always"])
+                                } else {
+                                    ("diff", &["-y", "--color=always", "-W", "160"])
+                                };
+                                Self::compute_external_diff(cmd, args, &expected, &actual, machine_output)
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                handles
+                    .into_iter()
+                    .map(|h| h.map(|handle| handle.join().unwrap_or_default()))
+                    .collect()
+            } else {
+                vec![None; sorted_failures.len()]
+            };
+
+            // Print results sequentially
+            for (failure, diff_output) in sorted_failures.iter().zip(diff_results.iter()) {
                 println!("\n{}", failure.test_name.red());
 
                 if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
-                    self.show_diff(expected, actual);
+                    if let Some(diff) = diff_output {
+                        // Pre-computed diff from parallel execution
+                        print!("{}", diff);
+                    } else {
+                        // diff_tool == "none", show inline
+                        self.show_diff(expected, actual);
+                    }
                 } else if !failure.output_lines.is_empty() {
                     let relevant_lines: Vec<_> = failure
                         .output_lines
@@ -1438,13 +1469,6 @@ impl TestRunner {
                             println!("{}", line);
                         } else {
                             println!("  {}", line.dimmed());
-                        }
-                    }
-                    if failure.output_lines.len() > OUTPUT_TRUNCATE_LINES {
-                        if self.machine_output {
-                            println!("(truncated) ...");
-                        } else {
-                            println!("  {} ...", "(truncated)".dimmed());
                         }
                     }
                 }
