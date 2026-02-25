@@ -229,7 +229,7 @@ pub fn extract_base_test_file(test_name: &str) -> Option<String> {
 fn should_retry_test(
     outcome: &TestOutcome,
     max_retries: usize,
-    retried_tests: &Mutex<HashSet<String>>,
+    retried_tests: &Mutex<HashMap<String, usize>>,
     work_pool: &Arc<WorkPool>,
 ) -> bool {
     if max_retries == 0 {
@@ -238,11 +238,12 @@ fn should_retry_test(
 
     let should_retry = {
         let mut retried = retried_tests.lock().unwrap();
-        if retried.contains(&outcome.name) {
-            false
-        } else {
-            retried.insert(outcome.name.clone());
+        let retry_count = retried.entry(outcome.name.clone()).or_insert(0);
+        if *retry_count < max_retries {
+            *retry_count += 1;
             true
+        } else {
+            false
         }
     };
 
@@ -270,7 +271,7 @@ fn process_outcome(
 
     match outcome.result {
         TestResult::Passed => {
-            let was_retry = ctx.retried_tests.lock().unwrap().contains(&outcome.name);
+            let was_retry = ctx.retried_tests.lock().unwrap().contains_key(&outcome.name);
             ctx.stats.passed.fetch_add(1, Ordering::SeqCst);
             if was_retry {
                 ctx.stats.retried_and_passed.fetch_add(1, Ordering::SeqCst);
@@ -325,7 +326,7 @@ pub fn run_batch_with_pool(
     stats: &TestStats,
     failures: &Mutex<Vec<FailureInfo>>,
     max_retries: usize,
-    retried_tests: &Mutex<HashSet<String>>,
+    retried_tests: &Mutex<HashMap<String, usize>>,
     work_pool: &Arc<WorkPool>,
     running: &AtomicUsize,
     machine_output: bool,
@@ -705,7 +706,7 @@ pub struct TestRunner {
     pub args: crate::Args,
     pub stats: Arc<TestStats>,
     pub failures: Arc<Mutex<Vec<FailureInfo>>>,
-    pub retried_tests: Arc<Mutex<HashSet<String>>>,
+    pub retried_tests: Arc<Mutex<HashMap<String, usize>>>,
     pub machine_output: bool,
     pub timing_cache: Mutex<TimingCache>,
 }
@@ -718,7 +719,7 @@ impl TestRunner {
             args,
             stats: Arc::new(TestStats::default()),
             failures: Arc::new(Mutex::new(Vec::new())),
-            retried_tests: Arc::new(Mutex::new(HashSet::new())),
+            retried_tests: Arc::new(Mutex::new(HashMap::new())),
             machine_output,
             timing_cache: Mutex::new(TimingCache::default()),
         }
@@ -1010,18 +1011,22 @@ impl TestRunner {
             let adaptive = self.args.adaptive;
             let num_cpus = self.args.jobs;
             let adaptive_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+            let mut last_adaptive_check = Instant::now();
 
             while !work_pool.is_empty() || running.load(Ordering::SeqCst) > 0 {
                 if is_interrupted() {
                     break;
                 }
 
-                if adaptive && !work_pool.is_empty() {
+                // Check adaptive spawning every 5 seconds
+                if adaptive && !work_pool.is_empty() && last_adaptive_check.elapsed() >= Duration::from_secs(5) {
+                    last_adaptive_check = Instant::now();
+
                     let current_running = running.load(Ordering::SeqCst);
                     let current_adaptive = adaptive_running.load(Ordering::SeqCst);
                     let total_running = current_running + current_adaptive;
 
-                    let should_spawn = if let Some(load) = get_load_average() {
+                    let should_spawn = if let Some(load) = get_instantaneous_load() {
                         total_running < num_cpus && load < (num_cpus as f64 * 1.5)
                     } else {
                         total_running < num_cpus

@@ -61,7 +61,7 @@ sti -C /path/to/slang '^tests/compute' -- -api vk
 
 ### Advanced options
 
-- `--retries <N>` - Number of retries for failed tests (default: 2)
+- `--retries <N>` - Number of retries for failed tests (default: 2).
 - `--hide-ignored` - Hide ignored tests from output
 - `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
@@ -74,6 +74,7 @@ When stderr is not a TTY (e.g., in CI or when piped), output automatically switc
 ## Output format
 
 During execution, a progress line updates in place showing:
+
 ```
 [  467/3112 ]  15.0% | 131 passed, 0 failed, 336 ignored (7.5s) ETA: 42s [24/98]
 ```
@@ -84,11 +85,13 @@ During execution, a progress line updates in place showing:
 - `[running/remaining]` batches - helps identify parallelism issues
 
 When stderr is not a TTY (CI, piped output), progress is printed on separate lines:
+
 ```
 [467/3112] 131 passed, 0 failed, 336 ignored (7.5s) [24/98]
 ```
 
 At completion, a summary shows:
+
 - Failed tests with details and diff output
 - Overall statistics
 - Slowest files (if timing data available)
@@ -106,7 +109,7 @@ When slang-test crashes (segfault, timeout, or abnormal exit), the runner uses t
 
 ### How the crashing test is identified
 
-Since slang-test only prints test results *after* a test completes, a crash means the crashing test's name was never printed. The runner identifies it by:
+Since slang-test only prints test results _after_ a test completes, a crash means the crashing test's name was never printed. The runner identifies it by:
 
 1. **Tracking completed tests**: All test names that were printed before the crash are collected.
 2. **Computing remaining tests**: The runner compares the list of test files sent to the batch against the tests that completed. Any test file not accounted for in the output is considered "remaining".
@@ -126,13 +129,16 @@ Since slang-test only prints test results *after* a test completes, a crash mean
 Batch contains: `[test-a.slang, test-b.slang, test-c.slang, test-d.slang]`
 
 slang-test output before crash:
+
 ```
 passed test: 'test-a.slang (cpu)'
 ignored test: 'test-b.slang (cuda)'
 ```
+
 Then segfault occurs.
 
 Recovery:
+
 1. `test-a` counted as passed, `test-b` counted as ignored
 2. `test-c.slang` and `test-d.slang` are run individually
 3. If `test-c.slang` crashes again, it's marked as failed (crash)
@@ -161,17 +167,20 @@ ignored test: 'tests/compute/bar.slang (cuda)'
 ```
 
 Test names have the format:
+
 - `<test-file>.<variant> (<backend>)` - e.g., `tests/compute/array-param.slang.1 (cpu)`
 - `<test-file>.<variant> syn (<backend>)` - synthesized tests, e.g., `tests/compute/array-param.slang.5 syn (llvm)`
 - `<category>/<test-name>.internal` - internal unit tests, e.g., `slang-unit-test-tool/modulePtr.internal`
 
 Failure details are printed on lines starting with `[test-name]` **before** the `FAILED test:` line:
+
 ```
 [slang-unit-test-tool/RecordReplay_cpu_hello_world.internal] Failed to launch process of 'cpu-hello-world'
 FAILED test: 'slang-unit-test-tool/RecordReplay_cpu_hello_world.internal'
 ```
 
 Exit codes:
+
 - `0` - All tests passed (or only ignored)
 - `1` - Some tests failed
 

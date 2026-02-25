@@ -677,7 +677,7 @@ pub struct BatchContext<'a> {
     pub stats: &'a TestStats,
     pub failures: &'a Mutex<Vec<FailureInfo>>,
     pub max_retries: usize,
-    pub retried_tests: &'a Mutex<HashSet<String>>,
+    pub retried_tests: &'a Mutex<HashMap<String, usize>>,
     pub work_pool: &'a Arc<WorkPool>,
     pub running: &'a AtomicUsize,
     pub machine_output: bool,
@@ -747,12 +747,25 @@ fn get_gpu_usage() -> Option<u32> {
     }
 }
 
-pub fn get_load_average() -> Option<f64> {
-    let load = System::load_average();
-    if load.one > 0.0 {
-        Some(load.one)
-    } else {
-        None
+/// Get instantaneous CPU usage as a load-like value.
+/// Returns the number of "busy CPUs" (e.g., 50% usage on 8 cores = 4.0)
+pub fn get_instantaneous_load() -> Option<f64> {
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_cpu(CpuRefreshKind::everything())
+    );
+    // Need to refresh twice with a small delay to get accurate readings
+    sys.refresh_cpu_all();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    sys.refresh_cpu_all();
+
+    let num_cpus = sys.cpus().len();
+    if num_cpus == 0 {
+        return None;
     }
+
+    // Total CPU usage as percentage (0-100 per core)
+    let total_usage: f32 = sys.cpus().iter().map(|c| c.cpu_usage()).sum();
+    // Convert to load-like value: 100% on all cores = num_cpus
+    Some((total_usage / 100.0) as f64)
 }
 
