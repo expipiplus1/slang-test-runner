@@ -813,7 +813,7 @@ impl TestRunner {
         }
 
         // Discover tests via slang-test -dry-run (streaming)
-        let (rx, error_rx) = crate::discover_tests_streaming(
+        let (rx, error_rx, compiling_rx) = crate::discover_tests_streaming(
             self.args.slang_test.as_ref().unwrap(),
             &self.args.root_dir,
             &self.args.filters,
@@ -826,52 +826,78 @@ impl TestRunner {
         let mut test_files: Vec<String> = Vec::new();
         let mut cache_for_display: Option<TimingCache> = None;
         let mut total_predicted: f64 = 0.0;
+        let mut shown_compiling = false;
 
-        for test in rx {
+        loop {
             // Check for errors from the discovery thread
             if let Ok(error_msg) = error_rx.try_recv() {
                 anyhow::bail!("{}", error_msg);
             }
-            // Check if cache finished loading (non-blocking)
-            if cache_for_display.is_none() {
-                if let Ok(cache) = cache_rx.try_recv() {
-                    // Cache just loaded - compute predictions for all tests we've collected so far
-                    if let Some(bt) = build_type {
-                        total_predicted = test_files.iter()
-                            .map(|f| cache.predict(bt, &test_to_timing_key(f)))
-                            .sum();
+
+            // Check for compiling signal
+            if !shown_compiling && compiling_rx.try_recv().is_ok() {
+                if !self.machine_output {
+                    eprint!("\x1b[2mCompiling core module...\x1b[0m");
+                    let _ = std::io::stderr().flush();
+                }
+                shown_compiling = true;
+            }
+
+            // Try to receive with a timeout so we can check compiling signal
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(test) => {
+                    // Check if cache finished loading (non-blocking)
+                    if cache_for_display.is_none() {
+                        if let Ok(cache) = cache_rx.try_recv() {
+                            // Cache just loaded - compute predictions for all tests we've collected so far
+                            if let Some(bt) = build_type {
+                                total_predicted = test_files.iter()
+                                    .map(|f| cache.predict(bt, &test_to_timing_key(f)))
+                                    .sum();
+                            }
+                            cache_for_display = Some(cache);
+                        }
                     }
-                    cache_for_display = Some(cache);
+
+                    // Add prediction for this test incrementally (if cache is loaded)
+                    if let (Some(ref cache), Some(bt)) = (&cache_for_display, build_type) {
+                        total_predicted += cache.predict(bt, &test_to_timing_key(&test));
+                    }
+
+                    test_files.push(test);
+
+                    // Update progress display (only in TTY mode)
+                    if !self.machine_output {
+                        if cache_for_display.is_some() {
+                            // Show count with prediction
+                            let eta = total_predicted / self.args.jobs as f64;
+                            eprint!(
+                                "\r\x1b[KRunning {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
+                                test_files.len(),
+                                self.args.jobs,
+                                eta
+                            );
+                        } else {
+                            // Show count without prediction
+                            eprint!(
+                                "\r\x1b[KRunning {} tests with {} workers",
+                                test_files.len(),
+                                self.args.jobs
+                            );
+                        }
+                        let _ = std::io::stderr().flush();
+                    }
                 }
-            }
-
-            // Add prediction for this test incrementally (if cache is loaded)
-            if let (Some(ref cache), Some(bt)) = (&cache_for_display, build_type) {
-                total_predicted += cache.predict(bt, &test_to_timing_key(&test));
-            }
-
-            test_files.push(test);
-
-            // Update progress display (only in TTY mode)
-            if !self.machine_output {
-                if cache_for_display.is_some() {
-                    // Show count with prediction
-                    let eta = total_predicted / self.args.jobs as f64;
-                    eprint!(
-                        "\r\x1b[KRunning {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
-                        test_files.len(),
-                        self.args.jobs,
-                        eta
-                    );
-                } else {
-                    // Show count without prediction
-                    eprint!(
-                        "\r\x1b[KRunning {} tests with {} workers",
-                        test_files.len(),
-                        self.args.jobs
-                    );
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Still waiting - continue loop to check compiling signal
                 }
-                let _ = std::io::stderr().flush();
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // Channel closed - check for errors one more time
+                    if let Ok(error_msg) = error_rx.try_recv() {
+                        anyhow::bail!("{}", error_msg);
+                    }
+                    break;
+                }
             }
         }
 
@@ -1008,7 +1034,18 @@ impl TestRunner {
 
         let running = Arc::new(AtomicUsize::new(0));
         let adaptive_running = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
 
+        let timeout = Duration::from_secs(self.args.timeout);
+
+        // Mark execution started so progress display can show "waiting for output"
+        stats.mark_execution_started();
+
+        let debug_start = Instant::now();
+        eprintln!("[DEBUG {:>6.3}s] about to spawn progress thread", debug_start.elapsed().as_secs_f64());
+
+        // Spawn progress thread first
         let progress_stats = stats.clone();
         let progress_running = running.clone();
         let progress_adaptive = adaptive_running.clone();
@@ -1020,7 +1057,8 @@ impl TestRunner {
         let machine_output = self.machine_output;
         let progress_handle = thread::spawn(move || {
             let display = ProgressDisplay::new(total_files, total_predicted_time, machine_output);
-            let mut sys_stats = SystemStats::new();
+            // Initialize SystemStats lazily to avoid blocking the first progress update
+            let mut sys_stats: Option<SystemStats> = None;
             let mut stats_counter = 0u32;
             while !progress_shutdown_clone.load(Ordering::SeqCst) {
                 let files_done = progress_stats.files_completed();
@@ -1037,20 +1075,20 @@ impl TestRunner {
                 stats_counter += 1;
                 if stats_counter >= 10 {
                     stats_counter = 0;
-                    sys_stats.refresh_and_log(batches_running, adaptive_count, batches_remaining);
+                    let sys = sys_stats.get_or_insert_with(SystemStats::new);
+                    sys.refresh_and_log(batches_running, adaptive_count, batches_remaining);
                 }
 
                 thread::sleep(Duration::from_millis(100));
             }
         });
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
+        eprintln!("[DEBUG {:>6.3}s] progress thread spawned, about to spawn workers", debug_start.elapsed().as_secs_f64());
 
-        let timeout = Duration::from_secs(self.args.timeout);
-
+        // Spawn worker threads
         if !work_pool.is_empty() {
-            for _ in 0..self.args.jobs {
+            for i in 0..self.args.jobs {
+                eprintln!("[DEBUG {:>6.3}s] spawning worker {}", debug_start.elapsed().as_secs_f64(), i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                 let root_dir = self.args.root_dir.clone();
                 let extra_args = self.args.extra_args.clone();
@@ -1063,13 +1101,22 @@ impl TestRunner {
                 let machine_output = self.machine_output;
                 let verbose = self.args.verbose;
 
+                let worker_id = i;
+                let worker_debug_start = debug_start;
                 let handle = thread::spawn(move || {
+                    eprintln!("[DEBUG {:>6.3}s] worker {} started, getting first batch", worker_debug_start.elapsed().as_secs_f64(), worker_id);
                     loop {
                         if shutdown.load(Ordering::SeqCst) || is_interrupted() {
                             break;
                         }
 
+                        let get_batch_start = Instant::now();
                         if let Some(batch) = pool.try_get_batch() {
+                            let get_batch_time = get_batch_start.elapsed();
+                            if get_batch_time.as_millis() > 10 {
+                                eprintln!("[DEBUG {:>6.3}s] worker {} try_get_batch took {:.3}s", worker_debug_start.elapsed().as_secs_f64(), worker_id, get_batch_time.as_secs_f64());
+                            }
+                            eprintln!("[DEBUG {:>6.3}s] worker {} got batch of {} tests", worker_debug_start.elapsed().as_secs_f64(), worker_id, batch.len());
                             run_batch_with_pool(
                                 &slang_test,
                                 &root_dir,
@@ -1092,6 +1139,8 @@ impl TestRunner {
                 });
                 handles.push(handle);
             }
+
+            eprintln!("[DEBUG {:>6.3}s] all workers spawned, entering main loop", debug_start.elapsed().as_secs_f64());
 
             let adaptive = self.args.adaptive;
             let num_cpus = self.args.jobs;

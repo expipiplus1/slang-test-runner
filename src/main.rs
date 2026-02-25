@@ -134,7 +134,7 @@ pub fn discover_tests_via_dry_run(
     apis: &[String],
     ignore_apis: &[String],
 ) -> Result<Vec<String>> {
-    let (rx, error_rx) = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns, apis, ignore_apis)?;
+    let (rx, error_rx, _compiling_rx) = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns, apis, ignore_apis)?;
     let mut tests: Vec<String> = rx.iter().collect();
     // Check for errors after iteration completes
     if let Ok(error_msg) = error_rx.try_recv() {
@@ -146,7 +146,8 @@ pub fn discover_tests_via_dry_run(
 
 /// Discover tests using slang-test -dry-run, streaming results via channel
 /// Tests are sent as they are discovered, unsorted
-/// Returns (test_receiver, error_receiver) - check error_receiver after iteration
+/// Returns (test_receiver, error_receiver, compiling_receiver) - check error_receiver after iteration
+/// The compiling_receiver signals when "Compiling core module" is detected on stderr
 pub fn discover_tests_streaming(
     slang_test: &PathBuf,
     root_dir: &PathBuf,
@@ -154,7 +155,7 @@ pub fn discover_tests_streaming(
     ignore_patterns: &[String],
     apis: &[String],
     ignore_apis: &[String],
-) -> Result<(crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<String>)> {
+) -> Result<(crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<()>)> {
     use regex::Regex;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
@@ -228,8 +229,10 @@ pub fn discover_tests_streaming(
     let stderr = child.stderr.take().unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
+    let (compiling_tx, compiling_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Spawn a thread to check stderr for "unknown option" error (old slang-test)
+    // and "Compiling core module" message
     let stderr_error_tx = error_tx.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
@@ -241,6 +244,9 @@ pub fn discover_tests_streaming(
                          Please update to a newer version of slang.".to_string()
                     );
                     return;
+                }
+                if line.contains("Compiling core module") {
+                    let _ = compiling_tx.try_send(());
                 }
             }
         }
@@ -320,7 +326,7 @@ pub fn discover_tests_streaming(
         anyhow::bail!("{}", error_msg);
     }
 
-    Ok((rx, error_rx))
+    Ok((rx, error_rx, compiling_rx))
 }
 
 fn detect_slang_test_build(
@@ -450,12 +456,7 @@ fn main() -> Result<()> {
     // Fast path for dry-run: skip TestRunner creation, stream output
     if args.dry_run {
         let is_tty = is_stderr_tty();
-        let is_debug_build = slang_test_path
-            .to_string_lossy()
-            .to_lowercase()
-            .contains("debug");
-
-        let (rx, error_rx) = discover_tests_streaming(
+        let (rx, error_rx, compiling_rx) = discover_tests_streaming(
             &slang_test_path,
             &args.root_dir,
             &args.filters,
@@ -473,8 +474,17 @@ fn main() -> Result<()> {
                 anyhow::bail!("{}", error_msg);
             }
 
-            // Try to receive with a timeout so we can show compiling message while waiting
-            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            // Check for compiling signal
+            if !shown_compiling && compiling_rx.try_recv().is_ok() {
+                if is_tty {
+                    eprint!("\x1b[2mCompiling core module...\x1b[0m");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                shown_compiling = true;
+            }
+
+            // Try to receive with a timeout so we can check compiling signal
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(test) => {
                     // On first test output, clear any compiling message
                     if count == 0 && shown_compiling && is_tty {
@@ -484,14 +494,7 @@ fn main() -> Result<()> {
                     count += 1;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Still waiting - show compiling notice for debug builds
-                    if !shown_compiling && is_debug_build && is_tty {
-                        eprint!(
-                            "Compiling core module on debug build, this can take a while..."
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                        shown_compiling = true;
-                    }
+                    // Still waiting - continue loop to check compiling signal
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     // Channel closed - check for errors one more time

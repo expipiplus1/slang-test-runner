@@ -446,6 +446,13 @@ impl TestStats {
         self.compiling_since.lock().unwrap().map(|t| t.elapsed().as_secs_f64())
     }
 
+    pub fn mark_execution_started(&self) {
+        let mut last = self.last_test_output.lock().unwrap();
+        if last.is_none() {
+            *last = Some(Instant::now());
+        }
+    }
+
     pub fn record_test_output(&self) {
         *self.last_test_output.lock().unwrap() = Some(Instant::now());
     }
@@ -545,7 +552,10 @@ impl WorkPool {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let n = indexed.len();
-            let decay = 3.0 / n as f64;
+            // Decay so that test at position n/4 has ~5% of the weight of the slowest test.
+            // This ensures slow tests are strongly preferred while still allowing some randomness.
+            // exp(-decay * n/4) = 0.05  =>  decay = -ln(0.05) / (n/4) = 3 * 4 / n = 12/n
+            let decay = 12.0 / n as f64;
             let weights: Vec<f64> = (0..n)
                 .map(|i| (-decay * i as f64).exp())
                 .collect();
@@ -567,6 +577,28 @@ impl WorkPool {
         }
     }
 
+    /// Find the index of a test that exceeds the target batch duration (if any).
+    /// These "oversized" tests should be scheduled first to avoid long tails.
+    fn find_oversized_test_index(&self, files: &[String]) -> Option<usize> {
+        if !self.has_timing_data {
+            return None;
+        }
+
+        // Find the test with the longest duration that exceeds target
+        let mut best_idx = None;
+        let mut best_duration = self.target_batch_duration;
+
+        for (i, f) in files.iter().enumerate() {
+            let dur = self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+            if dur > best_duration {
+                best_duration = dur;
+                best_idx = Some(i);
+            }
+        }
+
+        best_idx
+    }
+
     pub fn try_get_batch(&self) -> Option<Vec<String>> {
         let mut files = self.files.lock().unwrap();
         if files.is_empty() {
@@ -580,6 +612,13 @@ impl WorkPool {
         }
 
         if self.has_timing_data {
+            // First priority: schedule any test that exceeds target batch duration.
+            // These tests will always be their own batch, so schedule them ASAP
+            // to avoid long tails at the end of the run.
+            if let Some(idx) = self.find_oversized_test_index(&files) {
+                return Some(vec![files.swap_remove(idx)]);
+            }
+
             let mut batch = Vec::new();
             let mut batch_duration = 0.0;
 
@@ -708,13 +747,13 @@ impl ProgressDisplay {
             };
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
-                if secs > 5.0 && batches_running > 0 {
-                    format!(" \x1b[2m[no output {:.0}s]\x1b[0m", secs)
+                if secs > 1.0 {
+                    format!(" \x1b[2m[waiting {:.0}s r={}]\x1b[0m", secs, batches_running)
                 } else {
                     String::new()
                 }
             } else {
-                String::new()
+                format!(" \x1b[2m[no timer]\x1b[0m")
             };
 
             let turbo_info = if adaptive_running > 0 {
