@@ -13,6 +13,38 @@ use std::time::{Duration, Instant};
 use crate::types::{*, TestId, test_to_timing_key};
 
 // ============================================================================
+// ETA Calculation and Display
+// ============================================================================
+
+/// Calculate initial ETA from predictions.
+/// ETA = max(total_predicted / num_workers, longest_single_test)
+/// This accounts for the "long pole" problem where one slow test dominates.
+fn calculate_initial_eta(predictions: impl Iterator<Item = f64>, num_workers: usize) -> f64 {
+    let mut total = 0.0f64;
+    let mut longest = 0.0f64;
+    for pred in predictions {
+        total += pred;
+        longest = longest.max(pred);
+    }
+    let parallel_eta = total / num_workers.max(1) as f64;
+    parallel_eta.max(longest)
+}
+
+/// Format the "Running N tests with M workers" message.
+fn format_running_message(num_tests: usize, num_workers: usize, predicted_eta: Option<f64>) -> String {
+    match predicted_eta {
+        Some(eta) => format!(
+            "Running {} tests with {} workers {}",
+            num_tests, num_workers, format!("(predicted {:.0}s)", eta).dimmed()
+        ),
+        None => format!(
+            "Running {} tests with {} workers",
+            num_tests, num_workers
+        ),
+    }
+}
+
+// ============================================================================
 // Global Flags
 // ============================================================================
 
@@ -825,8 +857,10 @@ impl TestRunner {
         // Collect tests while showing streaming progress (in TTY mode)
         let mut test_files: Vec<String> = Vec::new();
         let mut cache_for_display: Option<TimingCache> = None;
-        let mut total_predicted: f64 = 0.0;
         let mut shown_compiling = false;
+        // Track running totals for ETA calculation (avoids O(n²) iteration)
+        let mut total_predicted: f64 = 0.0;
+        let mut longest_test: f64 = 0.0;
 
         loop {
             // Check for errors from the discovery thread
@@ -849,42 +883,36 @@ impl TestRunner {
                     // Check if cache finished loading (non-blocking)
                     if cache_for_display.is_none() {
                         if let Ok(cache) = cache_rx.try_recv() {
-                            // Cache just loaded - compute predictions for all tests we've collected so far
+                            // Cache just loaded - compute totals for tests collected so far
                             if let Some(bt) = build_type {
-                                total_predicted = test_files.iter()
-                                    .map(|f| cache.predict(bt, &test_to_timing_key(f)))
-                                    .sum();
+                                for f in &test_files {
+                                    let pred = cache.predict(bt, &test_to_timing_key(f));
+                                    total_predicted += pred;
+                                    longest_test = longest_test.max(pred);
+                                }
                             }
                             cache_for_display = Some(cache);
                         }
                     }
 
-                    // Add prediction for this test incrementally (if cache is loaded)
+                    // Update running totals incrementally
                     if let (Some(ref cache), Some(bt)) = (&cache_for_display, build_type) {
-                        total_predicted += cache.predict(bt, &test_to_timing_key(&test));
+                        let pred = cache.predict(bt, &test_to_timing_key(&test));
+                        total_predicted += pred;
+                        longest_test = longest_test.max(pred);
                     }
 
                     test_files.push(test);
 
                     // Update progress display (only in TTY mode)
                     if !self.machine_output {
-                        if cache_for_display.is_some() {
-                            // Show count with prediction
-                            let eta = total_predicted / self.args.jobs as f64;
-                            eprint!(
-                                "\r\x1b[KRunning {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
-                                test_files.len(),
-                                self.args.jobs,
-                                eta
-                            );
+                        let eta = if cache_for_display.is_some() {
+                            let parallel_eta = total_predicted / self.args.jobs as f64;
+                            Some(parallel_eta.max(longest_test))
                         } else {
-                            // Show count without prediction
-                            eprint!(
-                                "\r\x1b[KRunning {} tests with {} workers",
-                                test_files.len(),
-                                self.args.jobs
-                            );
-                        }
+                            None
+                        };
+                        eprint!("\r\x1b[K{}", format_running_message(test_files.len(), self.args.jobs, eta));
                         let _ = std::io::stderr().flush();
                     }
                 }
@@ -1002,21 +1030,12 @@ impl TestRunner {
             test_files.to_vec()
         };
 
-        if has_timing_data {
-            let total_predicted: f64 = predictions.values().sum();
-            eprintln!(
-                "Running {} tests with {} workers \x1b[2m(predicted {:.0}s)\x1b[0m",
-                test_files.len(),
-                self.args.jobs,
-                total_predicted / self.args.jobs as f64
-            );
+        let eta = if has_timing_data {
+            Some(calculate_initial_eta(predictions.values().copied(), self.args.jobs))
         } else {
-            eprintln!(
-                "Running {} tests with {} workers",
-                test_files.len(),
-                self.args.jobs
-            );
-        }
+            None
+        };
+        eprintln!("{}", format_running_message(test_files.len(), self.args.jobs, eta));
 
         let work_pool = Arc::new(WorkPool::new(
             sorted_files,
