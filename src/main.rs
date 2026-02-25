@@ -8,8 +8,8 @@ use crossbeam_channel;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use runner::{set_interrupted, TestRunner};
-use types::{flush_event_log, init_event_log, log_event};
+use runner::{set_interrupted, TestRunner, run_early_api_check};
+use types::{flush_event_log, init_event_log, log_event, UnsupportedApis};
 
 // ============================================================================
 // CLI Arguments
@@ -110,6 +110,12 @@ pub struct Args {
     /// Batch 0 gets 1x this value, batch 1 gets 2x, etc. Set to 0 to disable.
     #[arg(long, default_value_t = 100)]
     pub gpu_stagger: u64,
+
+    /// Disable early API detection. By default, we run a quick check to detect which
+    /// APIs are supported before discovering tests, allowing us to skip tests for
+    /// unsupported APIs early.
+    #[arg(long)]
+    pub no_early_api_check: bool,
 }
 
 // ============================================================================
@@ -430,11 +436,24 @@ fn main() -> Result<()> {
     };
 
     args.slang_test = Some(slang_test_path.clone());
-    args.root_dir = root_dir;
+    args.root_dir = root_dir.clone();
+
+    // Start early API detection (unless disabled)
+    let api_check_rx = if !args.no_early_api_check {
+        Some(run_early_api_check(&slang_test_path, &root_dir))
+    } else {
+        None
+    };
 
     // Fast path for dry-run: skip TestRunner creation, stream output
     if args.dry_run {
         let is_tty = is_stderr_tty();
+
+        // Wait for API check to complete (with timeout) for filtering
+        let unsupported_apis = api_check_rx.and_then(|rx| {
+            rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+        });
+
         let (rx, error_rx, compiling_rx) = discover_tests_streaming(
             &slang_test_path,
             &args.root_dir,
@@ -445,6 +464,7 @@ fn main() -> Result<()> {
         )?;
 
         let mut count = 0;
+        let mut api_ignored = 0;
         let mut shown_compiling = false;
 
         loop {
@@ -465,6 +485,14 @@ fn main() -> Result<()> {
             // Try to receive with a timeout so we can check compiling signal
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(test) => {
+                    // Filter tests for unsupported APIs
+                    if let Some(ref unsupported) = unsupported_apis {
+                        if unsupported.is_test_unsupported(&test) {
+                            api_ignored += 1;
+                            continue;
+                        }
+                    }
+
                     // On first test output, clear any compiling message
                     if count == 0 && shown_compiling && is_tty {
                         eprint!("\r\x1b[K");
@@ -488,11 +516,35 @@ fn main() -> Result<()> {
             }
         }
 
-        eprintln!("{} tests would be run", count);
+        let ignored_msg = if api_ignored > 0 {
+            format!(" (ignored {} tests on unsupported APIs)", api_ignored)
+        } else {
+            String::new()
+        };
+        eprintln!("{} tests would be run{}", count, ignored_msg);
         std::process::exit(0);
     }
 
-    let runner = TestRunner::new(args);
+    // Wait for API check to complete before creating TestRunner
+    let unsupported_apis: Option<UnsupportedApis> = if let Some(rx) = api_check_rx {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => {
+                // Warn if API check had errors
+                if let Some(ref error) = result.error {
+                    eprintln!("{}", format!("Warning: API detection: {}", error).dimmed());
+                }
+                Some(result)
+            }
+            Err(_) => {
+                eprintln!("{}", "Warning: API detection timed out, will detect APIs per-batch".dimmed());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let runner = TestRunner::new(args, unsupported_apis);
     let success = runner.run()?;
 
     runner.save_timing();

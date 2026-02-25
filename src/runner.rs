@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, Scheduler, SchedulerHandle};
+use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, Scheduler, SchedulerHandle, UnsupportedApis};
 
 // ============================================================================
 // Debug Logging
@@ -82,15 +82,21 @@ fn calculate_initial_eta(
 }
 
 /// Format the "Running N tests with M workers" message.
-fn format_running_message(num_tests: usize, num_workers: usize, predicted_eta: Option<f64>) -> String {
+fn format_running_message(num_tests: usize, num_workers: usize, predicted_eta: Option<f64>, api_ignored: usize) -> String {
+    let ignored_part = if api_ignored > 0 {
+        format!(" {}", format!("(ignored {} tests on unsupported APIs)", api_ignored).dimmed())
+    } else {
+        String::new()
+    };
+
     match predicted_eta {
         Some(eta) => format!(
-            "Running {} tests with {} workers {}",
-            num_tests, num_workers, format!("(predicted {:.0}s)", eta).dimmed()
+            "Running {} tests with {} workers {}{}",
+            num_tests, num_workers, format!("(predicted {:.0}s)", eta).dimmed(), ignored_part
         ),
         None => format!(
-            "Running {} tests with {} workers",
-            num_tests, num_workers
+            "Running {} tests with {} workers{}",
+            num_tests, num_workers, ignored_part
         ),
     }
 }
@@ -159,6 +165,129 @@ pub fn set_interrupted() {
         std::process::exit(130);
     }
     eprintln!("\nInterrupt received (Ctrl-C)");
+}
+
+// ============================================================================
+// Early API Detection
+// ============================================================================
+
+/// Run early API detection by executing slang-test on a simple file.
+/// Parses "Check api,list: Supported/Not Supported" lines to determine which APIs are unavailable.
+/// Returns a channel that will receive the UnsupportedApis result when detection completes.
+pub fn run_early_api_check(
+    slang_test: &PathBuf,
+    root_dir: &PathBuf,
+) -> crossbeam_channel::Receiver<UnsupportedApis> {
+    use std::process::{Command, Stdio};
+
+    let (tx, rx) = crossbeam_channel::bounded::<UnsupportedApis>(1);
+
+    // Start with platform defaults
+    let mut unsupported = UnsupportedApis::platform_defaults();
+
+    let slang_test = slang_test.clone();
+    let root_dir = root_dir.clone();
+
+    thread::spawn(move || {
+        log_event("api_check_start", &format!("{} tests/compute/simple.slang -api cpu", slang_test.display()));
+
+        // Run slang-test on a simple file with -api cpu to see what APIs are checked
+        let child = Command::new(&slang_test)
+            .arg("tests/compute/simple.slang")
+            .arg("-api")
+            .arg("cpu")
+            .current_dir(&root_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                unsupported.error = Some(format!("Failed to spawn slang-test for API check: {}", e));
+                let _ = tx.send(unsupported);
+                return;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                unsupported.error = Some("Failed to capture stdout for API check".to_string());
+                let _ = child.kill();
+                reap_process(child);
+                let _ = tx.send(unsupported);
+                return;
+            }
+        };
+
+        let reader = BufReader::new(stdout);
+        let mut saw_any_check = false;
+        let mut last_check_time = std::time::Instant::now();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            // Parse "Check vk,vulkan: Supported" or "Check dx12,d3d12: Not Supported"
+            if line.starts_with("Check ") {
+                saw_any_check = true;
+                last_check_time = std::time::Instant::now();
+
+                // Parse format: "Check api1,api2,api3: Supported/Not Supported"
+                if let Some(colon_pos) = line.find(':') {
+                    let api_part = &line[6..colon_pos]; // Skip "Check "
+                    let status_part = line[colon_pos + 1..].trim();
+
+                    // Add each API in the comma-separated list
+                    for api in api_part.split(',') {
+                        let api = api.trim();
+                        if !api.is_empty() {
+                            if status_part == "Not Supported" {
+                                unsupported.add_unsupported(api);
+                                debug_log!("API check: {} is NOT supported", api);
+                            } else if status_part == "Supported" {
+                                unsupported.add_supported(api);
+                                debug_log!("API check: {} is supported", api);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // If we've seen Check lines and now see a non-Check line, we're done
+            // Early out to avoid waiting for test execution
+            if saw_any_check && !line.starts_with("Check ") && !line.starts_with("Supported backends:") {
+                debug_log!("API check: early exit after seeing non-Check line");
+                break;
+            }
+
+            // Safety: if we haven't seen any Check line in 2 seconds, bail
+            if !saw_any_check && last_check_time.elapsed().as_secs() > 2 {
+                debug_log!("API check: timeout waiting for Check lines");
+                break;
+            }
+        }
+
+        // Kill the process since we're done early (don't need actual test results)
+        let _ = child.kill();
+        reap_process_with_label(child, "api_check".to_string());
+
+        unsupported.check_completed = saw_any_check;
+        if !saw_any_check {
+            unsupported.error = Some("No Check lines found in slang-test output".to_string());
+        }
+
+        log_event("api_check_end", &format!("unsupported={:?} completed={}",
+            unsupported.unsupported.iter().collect::<Vec<_>>(), unsupported.check_completed));
+
+        let _ = tx.send(unsupported);
+    });
+
+    rx
 }
 
 /// Format exit status in a platform-appropriate way
@@ -953,14 +1082,24 @@ pub struct TestRunner {
     pub machine_output: bool,
     pub timing_cache: Mutex<TimingCache>,
     pub build_type: Option<BuildType>,
+    /// Unsupported APIs detected at startup (or None if check disabled)
+    pub unsupported_apis: Option<UnsupportedApis>,
+    /// Count of tests ignored due to unsupported APIs
+    pub api_ignored_count: AtomicUsize,
+    /// Whether to pass -skip-api-detection to slang-test (when we've done the check)
+    pub skip_api_detection: bool,
 }
 
 impl TestRunner {
-    pub fn new(args: crate::Args) -> Self {
+    pub fn new(args: crate::Args, unsupported_apis: Option<UnsupportedApis>) -> Self {
         let machine_output = !crate::is_stderr_tty();
         // Detect build type from slang-test path
         let build_type = args.slang_test.as_ref()
             .and_then(|p| BuildType::from_path(p));
+        // Skip API detection in batch calls if we did the check successfully
+        let skip_api_detection = unsupported_apis.as_ref()
+            .map(|u| u.check_completed)
+            .unwrap_or(false);
         // Don't load timing cache yet - will be loaded concurrently with discovery
         Self {
             args,
@@ -970,6 +1109,9 @@ impl TestRunner {
             machine_output,
             timing_cache: Mutex::new(TimingCache::default()),
             build_type,
+            unsupported_apis,
+            api_ignored_count: AtomicUsize::new(0),
+            skip_api_detection,
         }
     }
 
@@ -1028,6 +1170,10 @@ impl TestRunner {
         // Track running totals for ETA calculation (avoids O(n²) iteration)
         let mut total_predicted: f64 = 0.0;
         let mut longest_test: f64 = 0.0;
+        // Track tests ignored due to unsupported APIs
+        let mut api_ignored: usize = 0;
+        // Track unknown APIs (not in supported or unsupported lists)
+        let mut unknown_apis: HashSet<String> = HashSet::new();
 
         // Create discovery progress bar (TTY mode only)
         let discovery_pb = if self.machine_output {
@@ -1062,6 +1208,18 @@ impl TestRunner {
             // Try to receive with a timeout so we can check compiling signal
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(test) => {
+                    // Filter out tests for unsupported APIs early
+                    if let Some(ref unsupported) = self.unsupported_apis {
+                        if unsupported.is_test_unsupported(&test) {
+                            api_ignored += 1;
+                            continue;
+                        }
+                        // Track unknown APIs
+                        if let Some(unknown_api) = unsupported.get_unknown_api(&test) {
+                            unknown_apis.insert(unknown_api);
+                        }
+                    }
+
                     // Check if cache finished loading (non-blocking)
                     if cache_for_display.is_none() {
                         if let Ok(cache) = cache_rx.try_recv() {
@@ -1094,7 +1252,7 @@ impl TestRunner {
                         } else {
                             None
                         };
-                        pb.set_message(format_running_message(test_files.len(), self.args.jobs, eta));
+                        pb.set_message(format_running_message(test_files.len(), self.args.jobs, eta, api_ignored));
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1134,11 +1292,22 @@ impl TestRunner {
         // Sort tests for deterministic ordering
         test_files.sort();
 
+        // Store api_ignored count for later use
+        self.api_ignored_count.store(api_ignored, Ordering::SeqCst);
+
+        // Track unknown APIs - warning will be printed after "Running X tests" message
+        let has_unknown_apis = !unknown_apis.is_empty();
+
         if test_files.is_empty() {
             if let Some(pb) = discovery_pb {
                 pb.finish_and_clear();
             }
-            eprintln!("No tests found matching the specified criteria");
+            let msg = if api_ignored > 0 {
+                format!("No tests found matching the specified criteria (ignored {} tests on unsupported APIs)", api_ignored)
+            } else {
+                "No tests found matching the specified criteria".to_string()
+            };
+            eprintln!("{}", msg);
         } else if self.args.dry_run {
             if let Some(pb) = discovery_pb {
                 pb.finish_and_clear();
@@ -1147,10 +1316,15 @@ impl TestRunner {
             for test in &test_files {
                 println!("{}", test);
             }
-            eprintln!("{} tests would be run", test_files.len());
+            let ignored_msg = if api_ignored > 0 {
+                format!(" (ignored {} tests on unsupported APIs)", api_ignored)
+            } else {
+                String::new()
+            };
+            eprintln!("{} tests would be run{}", test_files.len(), ignored_msg);
             return Ok(true);
         } else {
-            self.run_file_tests(&test_files, discovery_pb)?;
+            self.run_file_tests(&test_files, discovery_pb, api_ignored, has_unknown_apis, unknown_apis)?;
         }
 
         let elapsed = start_time.elapsed();
@@ -1164,7 +1338,7 @@ impl TestRunner {
         Ok(self.stats.failed.load(Ordering::SeqCst) == 0 && !is_interrupted())
     }
 
-    fn run_file_tests(&self, test_files: &[String], discovery_pb: Option<ProgressBar>) -> Result<()> {
+    fn run_file_tests(&self, test_files: &[String], discovery_pb: Option<ProgressBar>, api_ignored: usize, has_unknown_apis: bool, unknown_apis: HashSet<String>) -> Result<()> {
         if test_files.is_empty() {
             if let Some(pb) = discovery_pb {
                 pb.finish_and_clear();
@@ -1275,13 +1449,27 @@ impl TestRunner {
 
         // Apply fudge factor to displayed ETA
         let display_eta = raw_eta.map(|eta| eta * fudge_factor);
-        let running_msg = format_running_message(test_files.len(), self.args.jobs, display_eta);
+        let running_msg = format_running_message(test_files.len(), self.args.jobs, display_eta, api_ignored);
         if let Some(pb) = discovery_pb {
             pb.finish_with_message(running_msg);
         } else {
             // Machine output mode
             eprintln!("{}", running_msg);
         }
+
+        // Warn about unknown APIs after "Running X tests" message
+        if has_unknown_apis {
+            let mut apis_list: Vec<_> = unknown_apis.iter().collect();
+            apis_list.sort();
+            eprintln!("{}", format!(
+                "Warning: Found tests for unknown APIs {:?} - will not skip API detection in batch runs",
+                apis_list
+            ).dimmed());
+        }
+
+        // Decide if we can skip API detection in batch calls
+        // Only skip if: we did the check successfully AND no unknown APIs were found
+        let skip_api_detection = self.skip_api_detection && !has_unknown_apis;
 
         // Record initial prediction for fudge factor calculation at end of run
         if let Some(eta) = raw_eta {
@@ -1394,7 +1582,11 @@ impl TestRunner {
                 debug_log!("spawning worker {}", i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
                 let root_dir = self.args.root_dir.clone();
-                let extra_args = self.args.extra_args.clone();
+                // Add -skip-api-detection if we've done the early API check successfully
+                let mut extra_args = self.args.extra_args.clone();
+                if skip_api_detection {
+                    extra_args.push("-skip-api-detection".to_string());
+                }
                 let stats = stats.clone();
                 let failures = failures.clone();
                 let retried_tests = retried_tests.clone();

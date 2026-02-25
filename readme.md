@@ -76,6 +76,7 @@ sti -g 4
 - `--batch-size <N>` - Maximum tests per slang-test invocation (default: auto-calculated as `(num_tests/jobs)*3`)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: auto-calculated as `predicted_runtime/2`, minimum 1.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
+- `--no-early-api-check` - Disable early API detection (see Early API Detection section below)
 - `--event-log <PATH>` - Write CSV event log for performance debugging
 - `--timeout <SECS>` - Timeout per test batch in seconds (default: 600 = 10 minutes)
 - `--gpu-stagger <MS>` - GPU stagger increment in milliseconds (default: 100). The first N batches (N = jobs) have increasing amounts of CPU work at the start to stagger GPU test launches, reducing Vulkan context creation contention.
@@ -192,6 +193,43 @@ Exit codes:
 
 - `0` - All tests passed (or only ignored)
 - `1` - Some tests failed
+
+## Early API Detection
+
+Before discovering tests, the runner performs a quick check to determine which graphics APIs are supported on the current system. This allows tests for unsupported APIs to be filtered out early, improving scheduling accuracy and reducing unnecessary work.
+
+### How it works
+
+1. **Quick probe**: At startup, runs `slang-test tests/compute/simple.slang -api cpu` which outputs "Check" lines indicating API support status
+2. **Parse results**: Lines like `Check vk,vulkan: Supported` and `Check dx12,d3d12: Not Supported` are parsed to build a list of unsupported APIs
+3. **Early filtering**: During test discovery, tests for unsupported APIs are filtered out and counted separately
+4. **Optimized batch runs**: When the API check succeeds, `-skip-api-detection` is passed to batch slang-test invocations since we already know which APIs are available
+
+### Platform defaults
+
+Some APIs are known to be unavailable on certain platforms:
+
+- **Linux/macOS**: Metal (`mtl`, `metal`) and WGPU (`wgpu`) are marked unsupported
+- **macOS**: DirectX (`dx11`, `dx12`, `d3d11`, `d3d12`) is marked unsupported
+- **All platforms**: CPU (`cpu`) is always marked as supported
+
+### Output
+
+The "Running X tests" message shows how many tests were filtered:
+
+```
+Running 5494 tests with 32 workers (predicted 29s) (ignored 3053 tests on unsupported APIs)
+```
+
+If tests are found for APIs that weren't in the Check output (unknown APIs), a warning is shown and `-skip-api-detection` is not used:
+
+```
+Warning: Found tests for unknown APIs ["newapi"] - will not skip API detection in batch runs
+```
+
+### Disabling
+
+Use `--no-early-api-check` to disable this feature and let each batch detect API support individually.
 
 ## Core Module Compilation
 
