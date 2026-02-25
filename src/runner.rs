@@ -2,6 +2,7 @@ use anyhow::Result;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -1180,10 +1181,45 @@ impl TestRunner {
                 .collect()
         };
 
-        // Shuffle tests randomly to avoid GPU contention from alphabetical ordering.
-        // With timing data, we use tail prioritization (in scheduler) to avoid long pole.
-        // Without timing data, random order is still better than alphabetical for GPU spread.
-        let sorted_files: Vec<String> = {
+        // Biased shuffle: slow tests appear earlier but spread out to avoid GPU contention.
+        // 90% of slow tests in first half with smooth falloff, plus random jitter.
+        // This balances: (1) starting slow tests early to avoid long tail,
+        // (2) spreading GPU tests to avoid contention spikes.
+        let sorted_files: Vec<String> = if has_timing_data {
+            let mut rng = rand::thread_rng();
+
+            // Sort by duration to get percentile ranks
+            let mut files_with_dur: Vec<_> = test_files.iter()
+                .map(|f| {
+                    let dur = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                    (f.clone(), dur)
+                })
+                .collect();
+            files_with_dur.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Assign biased positions: slow tests earlier but with spread
+            // Using power curve: position = percentile^0.6 (biases slow tests to front)
+            // Plus jitter for randomness
+            let n = files_with_dur.len() as f64;
+            let mut files_with_pos: Vec<_> = files_with_dur.into_iter()
+                .enumerate()
+                .map(|(i, (file, _dur))| {
+                    let percentile = i as f64 / n.max(1.0); // 0 = slowest, 1 = fastest
+                    // Power curve biases slow tests toward front
+                    // 0.6 power: slowest 10% -> first 25%, slowest 25% -> first 40%
+                    let biased = percentile.powf(0.6);
+                    // Add jitter (±15%) for spread
+                    let jitter = rng.gen_range(-0.15..0.15);
+                    let position = (biased + jitter).clamp(0.0, 1.0);
+                    (file, position)
+                })
+                .collect();
+
+            // Sort by biased position
+            files_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            files_with_pos.into_iter().map(|(f, _)| f).collect()
+        } else {
+            // No timing data - pure random shuffle
             let mut files = test_files.to_vec();
             files.shuffle(&mut rand::thread_rng());
             files
