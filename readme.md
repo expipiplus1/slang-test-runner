@@ -69,7 +69,7 @@ sti --ignore-api cuda
 
 - `--retries <N>` - Number of retries for failed tests (default: 2).
 - `--hide-ignored` - Hide ignored tests from output
-- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 100)
+- `--batch-size <N>` - Maximum tests per slang-test invocation (default: 300)
 - `--batch-duration <SECS>` - Target batch duration in seconds when timing data is available (default: 10.0)
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
 - `--adaptive` - Adaptive load balancing: spawn extra workers when CPU is underutilized
@@ -83,15 +83,14 @@ When stderr is not a TTY (e.g., in CI or when piped), output automatically switc
 During execution, a progress line updates in place showing:
 
 ```
-[  467/3112 ]  15.0% | 131 passed, 0 failed, 336 ignored (7.5s) ETA: 42s [24/98]
+[32/7786/7885] 0.0% | 0 passed, 0 failed, 0 ignored | Elapsed: 0.5s | ETA: 42.7s
 ```
 
-- Files completed / total files with percentage
+- `[running/remaining/total]` - batches running, batches remaining, total tests
 - Test counts (passed, failed, ignored)
 - Elapsed time and ETA
-- `[running/remaining]` batches - helps identify parallelism issues
 
-When stderr is not a TTY (CI, piped output), progress is printed on separate lines:
+When stderr is not a TTY (CI, piped output), progress is printed on separate lines at 10% intervals:
 
 ```
 [467/3112] 131 passed, 0 failed, 336 ignored (7.5s) [24/98]
@@ -125,9 +124,9 @@ Since slang-test only prints test results _after_ a test completes, a crash mean
 
 1. **Process completed results**: Tests that passed/failed/ignored before the crash are counted normally.
 
-2. **Isolate the crash**: Each remaining test file is run individually in its own slang-test process.
+2. **Identify the culprit**: The first test that didn't complete is identified and marked as failed with "Test caused slang-test to crash".
 
-3. **Identify the culprit**: If a single-test run also crashes, that specific test is marked as failed with "Test caused a crash/segfault" and skipped. If it passes, it was likely affected by test interaction or timing.
+3. **Repool remaining tests**: Tests that were in the batch after the crashed test are put back into the work pool for other workers to pick up.
 
 4. **Continue execution**: Other batches and workers continue running unaffected.
 
@@ -147,9 +146,8 @@ Then segfault occurs.
 Recovery:
 
 1. `test-a` counted as passed, `test-b` counted as ignored
-2. `test-c.slang` and `test-d.slang` are run individually
-3. If `test-c.slang` crashes again, it's marked as failed (crash)
-4. If `test-d.slang` passes, it's counted normally
+2. `test-c.slang` marked as failed (crash) - it was the first test without output
+3. `test-d.slang` repooled for another worker to run
 
 ## Retry Logic
 
@@ -219,13 +217,11 @@ Instead of pre-creating batches, the runner uses a dynamic work pool that worker
 
 2. **Slow-first scheduling**: Files are sorted by predicted duration (longest first) and workers preferentially pick slower files. This prevents the "long tail" problem where one worker is stuck on slow tests at the end.
 
-3. **End-game single files**: When few files remain (less than 2x worker count), files are dispatched individually for maximum parallelism.
+3. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers.
 
-4. **Retry integration**: Failed tests go back into the same pool, automatically getting picked up by available workers.
-
-5. **Progress display**: Shows `[running/queued]` so you can see parallelism level:
-   - `[32/100]` = 32 batches running, 100 files still in queue
-   - `[8/0]` = 8 batches running, queue empty (finishing up)
+4. **Progress display**: Shows `[running/remaining/total]` so you can see parallelism level:
+   - `[32/100/3000]` = 32 batches running, 100 tests remaining in queue, 3000 total tests
+   - `[8/0/3000]` = 8 batches running, queue empty (finishing up)
 
 ## Timing-Based Scheduling
 
@@ -233,15 +229,13 @@ The runner maintains a cache of test execution times to optimize scheduling:
 
 ### How it works
 
-1. **Per-test timing**: During execution, the runner tracks how long each test takes, broken down by backend (vk, cpu, llvm, etc.)
+1. **Per-test timing**: During execution, the runner tracks how long each test variant takes (e.g., `tests/foo.slang.0`, `tests/foo.slang.1`)
 
 2. **Build-type segmentation**: Timing data is stored separately for debug, release, and relwithdebinfo builds. This ensures accurate predictions since debug builds are significantly slower than release builds.
 
 3. **Cache storage**: After each run, timing data is saved to the state directory (see below)
 
 4. **LPT scheduling**: On subsequent runs, files are sorted by predicted duration (longest first). This ensures slow tests start early and run concurrently with faster tests, preventing the "long tail" problem where all workers finish except one stuck on slow tests.
-
-5. **API-aware predictions**: When running with `-- -api vk`, only Vulkan backend timings are used for predictions. This prevents filtered runs from skewing estimates for full runs.
 
 ### State location
 

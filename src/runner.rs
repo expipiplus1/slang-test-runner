@@ -1068,7 +1068,6 @@ impl TestRunner {
         let retried_tests = self.retried_tests.clone();
 
         let running = Arc::new(AtomicUsize::new(0));
-        let adaptive_running = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
 
@@ -1082,7 +1081,6 @@ impl TestRunner {
         // Spawn progress thread first
         let progress_stats = stats.clone();
         let progress_running = running.clone();
-        let progress_adaptive = adaptive_running.clone();
         let progress_pool = work_pool.clone();
         let progress_shutdown = Arc::new(AtomicBool::new(false));
         let progress_shutdown_clone = progress_shutdown.clone();
@@ -1097,19 +1095,18 @@ impl TestRunner {
                 let files_done = progress_stats.files_completed();
                 let batches_running = progress_running.load(Ordering::SeqCst);
                 let batches_remaining = progress_pool.remaining();
-                let adaptive_count = progress_adaptive.load(Ordering::SeqCst);
                 let eta = if progress_pool.has_timing_data {
-                    Some(progress_pool.calculate_eta(batches_running + adaptive_count))
+                    Some(progress_pool.calculate_eta(batches_running))
                 } else {
                     None
                 };
-                display.update(&progress_stats, files_done, batches_running, batches_remaining, adaptive_count, eta);
+                display.update(&progress_stats, files_done, batches_running, batches_remaining, eta);
 
                 stats_counter += 1;
                 if stats_counter >= 10 {
                     stats_counter = 0;
                     let sys = sys_stats.get_or_insert_with(SystemStats::new);
-                    sys.refresh_and_log(batches_running, adaptive_count, batches_remaining);
+                    sys.refresh_and_log(batches_running, batches_remaining);
                 }
 
                 thread::sleep(Duration::from_millis(100));
@@ -1175,86 +1172,16 @@ impl TestRunner {
 
             debug_log!("all workers spawned, entering main loop");
 
-            let adaptive = self.args.adaptive;
-            let num_cpus = self.args.jobs;
-            let adaptive_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-            let mut last_adaptive_check = Instant::now();
-
             while !work_pool.is_empty() || running.load(Ordering::SeqCst) > 0 {
                 if is_interrupted() {
                     break;
                 }
-
-                // Check adaptive spawning every 5 seconds
-                if adaptive && !work_pool.is_empty() && last_adaptive_check.elapsed() >= Duration::from_secs(5) {
-                    last_adaptive_check = Instant::now();
-
-                    let current_running = running.load(Ordering::SeqCst);
-                    let current_adaptive = adaptive_running.load(Ordering::SeqCst);
-                    let total_running = current_running + current_adaptive;
-
-                    let should_spawn = if let Some(load) = get_instantaneous_load() {
-                        total_running < num_cpus && load < (num_cpus as f64 * 1.5)
-                    } else {
-                        total_running < num_cpus
-                    };
-
-                    if should_spawn {
-                        let extra_to_spawn = (num_cpus - total_running).min(4);
-                        for _ in 0..extra_to_spawn {
-                            if let Some((batch_id, batch)) = work_pool.try_get_medium_batch() {
-                                let slang_test = self.args.slang_test.as_ref().unwrap().clone();
-                                let root_dir = self.args.root_dir.clone();
-                                let extra_args = self.args.extra_args.clone();
-                                let stats = stats.clone();
-                                let failures = failures.clone();
-                                let retried_tests = retried_tests.clone();
-                                let pool = work_pool.clone();
-                                let running = running.clone();
-                                let adaptive_counter = adaptive_running.clone();
-                                let machine_output = self.machine_output;
-                                let verbose = self.args.verbose;
-
-                                adaptive_counter.fetch_add(1, Ordering::SeqCst);
-                                log_event("turbo_spawn", &format!("total_running={} file={}",
-                                    total_running, &batch[0]));
-
-                                let handle = thread::spawn(move || {
-                                    run_batch_with_pool(
-                                        &slang_test,
-                                        &root_dir,
-                                        &batch,
-                                        &extra_args,
-                                        timeout,
-                                        &stats,
-                                        &failures,
-                                        retries,
-                                        &retried_tests,
-                                        &pool,
-                                        &running,
-                                        machine_output,
-                                        verbose,
-                                    );
-                                    pool.complete_batch(batch_id);
-                                    adaptive_counter.fetch_sub(1, Ordering::SeqCst);
-                                });
-                                adaptive_handles.lock().unwrap().push(handle);
-                            }
-                        }
-                    }
-                }
-
                 thread::sleep(Duration::from_millis(20));
             }
 
             shutdown.store(true, Ordering::SeqCst);
 
             for handle in handles {
-                handle.join().unwrap();
-            }
-
-            let mut adaptive_guard = adaptive_handles.lock().unwrap();
-            for handle in adaptive_guard.drain(..) {
                 handle.join().unwrap();
             }
 
@@ -1458,16 +1385,16 @@ impl TestRunner {
             if interrupted {
                 if failed == 0 {
                     println!(
-                        "{}: {} passed, {} ignored in {:.1}s (incomplete - interrupted)",
-                        "INTERRUPTED".yellow().bold(),
+                        "{}: {} passed, {} ignored in {:.1}s",
+                        "Interrupted".yellow().bold(),
                         passed,
                         ignored,
                         elapsed.as_secs_f64()
                     );
                 } else {
                     println!(
-                        "{}: {} passed, {} failed, {} ignored in {:.1}s (incomplete - interrupted)",
-                        "INTERRUPTED".yellow().bold(),
+                        "{}: {} passed, {} failed, {} ignored in {:.1}s",
+                        "Interrupted".yellow().bold(),
                         passed,
                         failed,
                         ignored,

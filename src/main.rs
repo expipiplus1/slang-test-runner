@@ -88,10 +88,6 @@ pub struct Args {
     #[arg(long)]
     pub no_timing_cache: bool,
 
-    /// Adaptive load balancing: spawn extra small batches when CPU is underutilized
-    #[arg(long)]
-    pub adaptive: bool,
-
     /// Write event log to file for performance debugging
     #[arg(long)]
     pub event_log: Option<PathBuf>,
@@ -410,8 +406,8 @@ fn main() -> Result<()> {
         log_event(
             "start",
             &format!(
-                "jobs={} batch_size={} adaptive={}",
-                args.jobs, args.batch_size, args.adaptive
+                "jobs={} batch_size={}",
+                args.jobs, args.batch_size
             ),
         );
     }
@@ -428,7 +424,8 @@ fn main() -> Result<()> {
         let (path, build_type, available) =
             detect_slang_test_build(&root_dir, args.build_type.as_deref())?;
 
-        if available.len() > 1 {
+        // Only show build selection info if user didn't explicitly choose and multiple are available
+        if available.len() > 1 && args.build_type.is_none() {
             eprintln!(
                 "{}",
                 format!(

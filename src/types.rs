@@ -717,11 +717,6 @@ impl WorkPool {
         parallel_eta.max(longest_remaining)
     }
 
-    /// Get a single-test batch (used for adaptive spawning)
-    pub fn try_get_medium_batch(&self) -> Option<(usize, Vec<String>)> {
-        // For adaptive spawning, just get a regular batch
-        self.try_get_batch()
-    }
 }
 
 // ============================================================================
@@ -745,7 +740,7 @@ impl ProgressDisplay {
         }
     }
 
-    pub fn update(&self, stats: &TestStats, files_completed: usize, batches_running: usize, batches_remaining: usize, adaptive_running: usize, eta_seconds: Option<f64>) {
+    pub fn update(&self, stats: &TestStats, files_completed: usize, batches_running: usize, batches_remaining: usize, eta_seconds: Option<f64>) {
         let passed = stats.passed.load(Ordering::SeqCst);
         let failed = stats.failed.load(Ordering::SeqCst);
         let ignored = stats.ignored.load(Ordering::SeqCst);
@@ -757,11 +752,10 @@ impl ProgressDisplay {
             let report_interval = (self.total_files / 10).max(1);
             if files_completed >= last_files + report_interval {
                 self.last_reported_files.store(files_completed, Ordering::SeqCst);
-                let turbo = if adaptive_running > 0 { format!(" +{} turbo", adaptive_running) } else { String::new() };
                 eprintln!(
-                    "[{}/{}] {} passed, {} failed, {} ignored ({:.1}s) [{}/{}]{}",
+                    "[{}/{}] {} passed, {} failed, {} ignored ({:.1}s) [{}/{}]",
                     files_completed, self.total_files, passed, failed, ignored, elapsed,
-                    batches_running, batches_remaining, turbo
+                    batches_running, batches_remaining
                 );
             }
         } else {
@@ -796,16 +790,10 @@ impl ProgressDisplay {
                 format!(" \x1b[2m[no timer]\x1b[0m")
             };
 
-            let turbo_info = if adaptive_running > 0 {
-                format!(" \x1b[33m+{} turbo\x1b[0m", adaptive_running)
-            } else {
-                String::new()
-            };
-
             eprint!(
-                "\r\x1b[K[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s |{}{}{}{}",
+                "\r\x1b[K[{}/{}/{}] {:.1}% | {}/{}/{} passed/failed/ignored | Elapsed: {:.1}s |{}{}{}",
                 batches_running, batches_remaining, self.total_files, percent, passed, failed, ignored, elapsed, eta,
-                turbo_info, compiling_info, stuck_info
+                compiling_info, stuck_info
             );
             let _ = std::io::stderr().flush();
         }
@@ -848,7 +836,7 @@ impl SystemStats {
         Self { sys }
     }
 
-    pub fn refresh_and_log(&mut self, running: usize, adaptive: usize, pool_remaining: usize) {
+    pub fn refresh_and_log(&mut self, running: usize, pool_remaining: usize) {
         self.sys.refresh_cpu_all();
 
         let load = System::load_average();
@@ -860,8 +848,8 @@ impl SystemStats {
         let gpu_str = gpu_usage.map(|g| format!(" gpu={}%", g)).unwrap_or_default();
 
         log_event("stats", &format!(
-            "load_1m={:.2} load_5m={:.2} cpu_avg={:.1}%{} running={} adaptive={} pool={}",
-            load.one, load.five, cpu_usage, gpu_str, running, adaptive, pool_remaining
+            "load_1m={:.2} load_5m={:.2} cpu_avg={:.1}%{} running={} pool={}",
+            load.one, load.five, cpu_usage, gpu_str, running, pool_remaining
         ));
     }
 }
@@ -895,25 +883,4 @@ fn get_gpu_usage() -> Option<u32> {
     }
 }
 
-/// Get instantaneous CPU usage as a load-like value.
-/// Returns the number of "busy CPUs" (e.g., 50% usage on 8 cores = 4.0)
-pub fn get_instantaneous_load() -> Option<f64> {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::new().with_cpu(CpuRefreshKind::everything())
-    );
-    // Need to refresh twice with a small delay to get accurate readings
-    sys.refresh_cpu_all();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sys.refresh_cpu_all();
-
-    let num_cpus = sys.cpus().len();
-    if num_cpus == 0 {
-        return None;
-    }
-
-    // Total CPU usage as percentage (0-100 per core)
-    let total_usage: f32 = sys.cpus().iter().map(|c| c.cpu_usage()).sum();
-    // Convert to load-like value: 100% on all cores = num_cpus
-    Some((total_usage / 100.0) as f64)
-}
 
