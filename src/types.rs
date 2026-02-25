@@ -610,6 +610,8 @@ pub struct Scheduler {
     has_timing_data: bool,
     gpu_jobs: Option<usize>,
     gpu_in_flight: usize,
+    /// Number of workers (for parallelism optimization)
+    num_workers: usize,
 }
 
 impl Scheduler {
@@ -654,6 +656,7 @@ impl Scheduler {
             has_timing_data,
             gpu_jobs,
             gpu_in_flight: 0,
+            num_workers,
         };
 
         let handle = SchedulerHandle {
@@ -845,6 +848,94 @@ impl Scheduler {
         }
     }
 
+    /// Ensure we have enough batches to keep all workers busy.
+    /// Splits large batches when we have fewer batches than potentially idle workers.
+    /// This prevents tail latency where one worker runs many tests while others sit idle.
+    fn ensure_parallelism(&mut self) {
+        // How many workers could potentially be looking for work?
+        let idle_workers = self.num_workers.saturating_sub(self.in_flight.len());
+
+        // If we have fewer batches than idle workers, split the largest batches
+        while self.batches.len() < idle_workers {
+            if !self.split_largest_batch() {
+                break; // No more splittable batches
+            }
+        }
+    }
+
+    /// Split the largest batch into two roughly equal parts (by predicted duration).
+    /// Returns true if a split occurred, false if no splittable batch exists.
+    fn split_largest_batch(&mut self) -> bool {
+        // Find the largest batch (by test count) that can be split
+        // Batches are sorted smallest-first, so largest splittable is near the end
+        let split_idx = self.batches.iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| b.tests.len() > 1)
+            .map(|(i, _)| i);
+
+        let Some(idx) = split_idx else {
+            return false;
+        };
+
+        let batch = self.batches.remove(idx);
+        let kind = batch.kind;
+
+        // Calculate total predicted time for this batch
+        let total_predicted: f64 = batch.tests.iter()
+            .map(|t| self.predictions.get(t).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+            .sum();
+
+        // Split by predicted duration to balance work, not just count
+        let target = total_predicted / 2.0;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut left_time = 0.0;
+
+        for test in batch.tests {
+            let pred = self.predictions.get(&test).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+            if left_time < target && (left.is_empty() || left_time + pred <= target * 1.2) {
+                // Add to left if under target (with 20% tolerance to avoid bad splits)
+                left_time += pred;
+                left.push(test);
+            } else {
+                right.push(test);
+            }
+        }
+
+        // Ensure we actually split (don't create empty batches)
+        if left.is_empty() || right.is_empty() {
+            // Fallback: split by count
+            let mut all_tests = left;
+            all_tests.extend(right);
+            let mid = all_tests.len() / 2;
+            left = all_tests[..mid].to_vec();
+            right = all_tests[mid..].to_vec();
+        }
+
+        // Re-insert both batches
+        if !left.is_empty() {
+            self.batches.push(BatchWithKind { tests: left, kind });
+        }
+        if !right.is_empty() {
+            self.batches.push(BatchWithKind { tests: right, kind });
+        }
+
+        // Re-sort to maintain invariant (smallest first, so we pop largest)
+        self.batches.sort_by(|a, b| {
+            let dur_a: f64 = a.tests.iter()
+                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum();
+            let dur_b: f64 = b.tests.iter()
+                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
+                .sum();
+            // Smallest first (we pop from end to get largest)
+            dur_a.partial_cmp(&dur_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        true
+    }
+
     /// Rebuild batches if there are pending files, then get the next batch.
     /// The scheduler decides internally whether to give a GPU or CPU batch
     /// based on current gpu_in_flight count vs gpu_jobs limit.
@@ -872,6 +963,9 @@ impl Scheduler {
                 self.gpu_jobs,
             );
         }
+
+        // Ensure enough batches to keep workers busy (avoid tail latency)
+        self.ensure_parallelism();
 
         // Determine if we can give out a GPU batch (check limit atomically here)
         let can_give_gpu = match self.gpu_jobs {
