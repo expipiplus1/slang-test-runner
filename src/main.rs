@@ -338,14 +338,33 @@ fn detect_slang_test_build(
         if let Some((_, path, _)) = available.iter().find(|(name, _, _)| name == preferred) {
             return Ok((path.clone(), preferred.to_string(), available));
         } else {
+            // Find the expected path for the requested build type
+            let expected_path = build_types
+                .iter()
+                .find(|(name, _)| *name == preferred)
+                .map(|(_, path)| *path);
+
+            let path_hint = match expected_path {
+                Some(path) => format!("\n  Expected: {}", root_dir.join(path).display()),
+                None => format!(
+                    "\n  Valid build types: {}",
+                    build_types.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                ),
+            };
+
             anyhow::bail!(
-                "Build type '{}' not found. Available: {}",
+                "Build type '{}' not found.{}\n  Available: {}",
                 preferred,
-                available
-                    .iter()
-                    .map(|(n, _, _)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                path_hint,
+                if available.is_empty() {
+                    "none (no slang-test executables found)".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|(n, p, _)| format!("{} ({})", n, p.display()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             );
         }
     }
@@ -371,9 +390,6 @@ fn main() -> Result<()> {
     // Validate job counts
     if args.jobs == 0 {
         anyhow::bail!("-j/--jobs must be at least 1");
-    }
-    if args.gpu_jobs == Some(0) {
-        anyhow::bail!("-g/--gpu-jobs must be at least 1");
     }
 
     // Validate API filter combinations
@@ -450,9 +466,19 @@ fn main() -> Result<()> {
         let is_tty = is_stderr_tty();
 
         // Wait for API check to complete (with timeout) for filtering
-        let unsupported_apis = api_check_rx.and_then(|rx| {
-            rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
-        });
+        let unsupported_apis: Option<UnsupportedApis> = {
+            let base = api_check_rx.and_then(|rx| {
+                rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+            });
+            // Handle -g 0: mark all GPU APIs as unsupported
+            if args.gpu_jobs == Some(0) {
+                let mut result = base.unwrap_or_else(UnsupportedApis::platform_defaults);
+                result.disable_all_gpu_apis();
+                Some(result)
+            } else {
+                base
+            }
+        };
 
         let (rx, error_rx, compiling_rx) = discover_tests_streaming(
             &slang_test_path,
@@ -528,20 +554,38 @@ fn main() -> Result<()> {
     // Wait for API check to complete before creating TestRunner
     let unsupported_apis: Option<UnsupportedApis> = if let Some(rx) = api_check_rx {
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(result) => {
+            Ok(mut result) => {
                 // Warn if API check had errors
                 if let Some(ref error) = result.error {
                     eprintln!("{}", format!("Warning: API detection: {}", error).dimmed());
+                }
+                // If -g 0, mark all GPU APIs as unsupported
+                if args.gpu_jobs == Some(0) {
+                    result.disable_all_gpu_apis();
                 }
                 Some(result)
             }
             Err(_) => {
                 eprintln!("{}", "Warning: API detection timed out, will detect APIs per-batch".dimmed());
-                None
+                // Even if API check timed out, still handle -g 0
+                if args.gpu_jobs == Some(0) {
+                    let mut result = UnsupportedApis::platform_defaults();
+                    result.disable_all_gpu_apis();
+                    Some(result)
+                } else {
+                    None
+                }
             }
         }
     } else {
-        None
+        // No early API check - but still handle -g 0
+        if args.gpu_jobs == Some(0) {
+            let mut result = UnsupportedApis::platform_defaults();
+            result.disable_all_gpu_apis();
+            Some(result)
+        } else {
+            None
+        }
     };
 
     let runner = TestRunner::new(args, unsupported_apis);

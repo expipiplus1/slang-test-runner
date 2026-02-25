@@ -935,10 +935,15 @@ pub fn run_batch_with_pool(
         } else {
             format!(" {}", ctx.extra_args.join(" "))
         };
+        // Convert test names to slang-test argument format (strip syn and API suffix)
+        let repro_args: Vec<String> = ctx.test_files
+            .iter()
+            .map(|f| TestId::parse(f).to_slang_test_arg())
+            .collect();
         eprintln!("{}", format!("\nWARNING: Batch took {:.1}s (predicted {:.1}s)", loop_time.as_secs_f64(), total_pred).dimmed());
         eprintln!("{}", format!("  Reproduce: time {} {}{}",
             ctx.slang_test.display(),
-            ctx.test_files.join(" "),
+            repro_args.join(" "),
             extra_args_str
         ).dimmed());
     }
@@ -1376,12 +1381,23 @@ impl TestRunner {
             (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / self.args.jobs as f64
         };
         let effective_batch_size = if self.args.batch_size == 0 {
-            ((test_files.len() / self.args.jobs) * 3).max(1)
+            if has_timing_data {
+                // With timing data, allow larger batches (3x tests per worker)
+                ((test_files.len() / self.args.jobs) * 3).max(1)
+            } else {
+                // Without timing data, be conservative: max 50, never more than 1/nworkers
+                50.min(test_files.len() / self.args.jobs).max(1)
+            }
         } else {
             self.args.batch_size
         };
         let effective_batch_duration = if self.args.batch_duration == 0.0 {
-            (predicted_runtime / 2.0).max(1.0)
+            if has_timing_data {
+                (predicted_runtime / 2.0).max(1.0)
+            } else {
+                // Without timing data, use a conservative fixed duration
+                10.0
+            }
         } else {
             self.args.batch_duration
         };
@@ -1455,6 +1471,17 @@ impl TestRunner {
         } else {
             // Machine output mode
             eprintln!("{}", running_msg);
+        }
+
+        // Warn about GPU tests being skipped when -g 0 is used
+        if let Some(ref unsupported) = self.unsupported_apis {
+            if unsupported.gpu_disabled {
+                let apis = UnsupportedApis::disabled_gpu_apis();
+                eprintln!("{}", format!(
+                    "GPU tests skipped (-g 0): {}, gfx-unit-test-tool",
+                    apis.join(", ")
+                ).dimmed());
+            }
         }
 
         // Warn about unknown APIs after "Running X tests" message

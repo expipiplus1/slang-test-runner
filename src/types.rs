@@ -199,6 +199,8 @@ pub struct UnsupportedApis {
     pub check_completed: bool,
     /// Error message if the check failed
     pub error: Option<String>,
+    /// Whether all GPU APIs were marked unsupported due to -g 0
+    pub gpu_disabled: bool,
 }
 
 impl UnsupportedApis {
@@ -238,6 +240,12 @@ impl UnsupportedApis {
     /// Check if a test's API is unsupported
     pub fn is_test_unsupported(&self, test: &str) -> bool {
         let test_id = TestId::parse(test);
+
+        // If GPU is disabled, also filter out gfx-unit-test-tool tests
+        if self.gpu_disabled && test_id.path.starts_with("gfx-unit-test-tool/") {
+            return true;
+        }
+
         if let Some(api) = test_id.api {
             self.unsupported.contains(&api.to_lowercase())
         } else {
@@ -296,6 +304,25 @@ impl UnsupportedApis {
         }
 
         result
+    }
+
+    /// Mark all GPU APIs as unsupported (used when -g 0 is specified)
+    pub fn disable_all_gpu_apis(&mut self) {
+        self.add_unsupported("vk");
+        self.add_unsupported("vulkan");
+        self.add_unsupported("cuda");
+        self.add_unsupported("dx11");
+        self.add_unsupported("dx12");
+        self.add_unsupported("d3d11");
+        self.add_unsupported("d3d12");
+        self.add_unsupported("metal");
+        self.add_unsupported("mtl");
+        self.gpu_disabled = true;
+    }
+
+    /// Get the list of GPU APIs that were disabled
+    pub fn disabled_gpu_apis() -> &'static [&'static str] {
+        &["vk", "cuda", "dx11", "dx12", "metal"]
     }
 }
 
