@@ -169,6 +169,47 @@ pub fn format_exit_status(status: Option<&std::process::ExitStatus>) -> String {
     }
 }
 
+/// Check if an exit status indicates a crash likely caused by a test (SIGSEGV, SIGABRT, etc.)
+/// vs an external kill (SIGTERM, SIGKILL, taskkill) where we should requeue all tests.
+/// Returns true if the crash was likely caused by a test.
+fn is_test_caused_crash(status: Option<&std::process::ExitStatus>) -> bool {
+    match status {
+        Some(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal() {
+                    // Signals that indicate a test caused the crash
+                    return matches!(signal,
+                        6 |   // SIGABRT - assertion failure, abort()
+                        7 |   // SIGBUS - bus error
+                        8 |   // SIGFPE - floating point exception
+                        11 |  // SIGSEGV - segmentation fault
+                        31    // SIGSYS - bad system call
+                    );
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                if let Some(code) = status.code() {
+                    // Windows crash codes in 0xC0000000+ range indicate test-caused crashes
+                    // (ACCESS_VIOLATION, STACK_OVERFLOW, etc.)
+                    // taskkill uses exit code 1, TerminateProcess uses the code you specify
+                    if (code as u32) >= 0xC0000000 {
+                        return true;
+                    }
+                }
+            }
+
+            // Non-zero exit code without a signal - could be test failure or external kill
+            // Be conservative: treat as external kill so we don't lose tests
+            false
+        }
+        None => false,
+    }
+}
+
 // ============================================================================
 // Static Regexes
 // ============================================================================
@@ -723,27 +764,6 @@ pub fn run_batch_with_pool(
     // We already have all the data we need via channels
     drop(output_handle);
 
-    // Report any tests that weren't accounted for in the output
-    if !is_interrupted() && !killed_for_compilation {
-        let mut unaccounted: Vec<&String> = Vec::new();
-        for file in ctx.test_files {
-            let test_id = TestId::parse(file);
-            let timing_key = test_id.to_timing_key();
-            if !seen_tests.contains(&timing_key) {
-                unaccounted.push(file);
-            }
-        }
-        if !unaccounted.is_empty() {
-            eprintln!("{}", format!("\nWARNING: {} unaccounted tests in batch:", unaccounted.len()).yellow());
-            for test in &unaccounted {
-                eprintln!("  {}", test);
-            }
-            if ctx.verbose {
-                eprintln!("  seen_tests: {:?}", seen_tests);
-            }
-        }
-    }
-
     // Detect crash or timeout: if we didn't see all tests and weren't interrupted/killed for compilation
     let all_tests_seen = seen_tests.len() >= expected_test_count;
     if !all_tests_seen && !is_interrupted() && !killed_for_compilation {
@@ -753,58 +773,66 @@ pub fn run_batch_with_pool(
             format_exit_status(exit_status.as_ref())
         };
 
-        // Since tests are now individual (with variant numbers), the crash/timeout must be
-        // caused by the first test we didn't see output for
-        let mut crashed_test: Option<String> = None;
-        let mut tests_to_repool: Vec<String> = Vec::new();
-        let mut found_crashed = false;
-
+        // Collect all unaccounted tests
+        let mut unaccounted_tests: Vec<String> = Vec::new();
         for file in ctx.test_files {
             let test_id = TestId::parse(file);
             let timing_key = test_id.to_timing_key();
             if !seen_tests.contains(&timing_key) {
-                if !found_crashed {
-                    crashed_test = Some(file.clone());
-                    found_crashed = true;
-                } else {
-                    // All tests after the crashed/timed-out one should be repooled
-                    tests_to_repool.push(file.clone());
+                unaccounted_tests.push(file.clone());
+            }
+        }
+
+        // Determine if this was a test-caused crash or an external kill
+        let test_caused = killed_for_timeout || is_test_caused_crash(exit_status.as_ref());
+
+        if test_caused {
+            // Test caused the crash/timeout - blame the first unaccounted test, repool the rest
+            let crashed_test = unaccounted_tests.first().cloned();
+            let tests_to_repool: Vec<String> = unaccounted_tests.iter().skip(1).cloned().collect();
+
+            for test in &tests_to_repool {
+                ctx.work_pool.add_file(test.clone());
+            }
+
+            if let Some(test) = crashed_test {
+                let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
+                eprintln!(
+                    "\n{}: slang-test {} ({}), skipping: {}",
+                    "ERROR".red(),
+                    error_type, exit_info, test
+                );
+                if !tests_to_repool.is_empty() {
+                    eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
                 }
+                ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+                let failure_msg = if killed_for_timeout {
+                    format!("Test timed out ({})", exit_info)
+                } else {
+                    format!("Test caused slang-test to crash ({})", exit_info)
+                };
+                ctx.failures.lock().unwrap().push(FailureInfo {
+                    test_name: test.clone(),
+                    output_lines: vec![failure_msg],
+                    expected: None,
+                    actual: None,
+                });
+
+                // Record timing for crashed/timed-out test using actual elapsed time
+                let test_id = TestId::parse(&test);
+                let timing_key = test_id.to_timing_key();
+                ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
             }
-        }
-
-        // Repool tests that didn't get a chance to run
-        for test in &tests_to_repool {
-            ctx.work_pool.add_file(test.clone());
-        }
-
-        if let Some(test) = crashed_test {
-            let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
+        } else {
+            // External kill (SIGTERM, SIGKILL, taskkill) - repool ALL unaccounted tests
             eprintln!(
-                "\nERROR: slang-test {} ({}), skipping: {}",
-                error_type, exit_info, test
+                "\n{}",
+                format!("slang-test killed externally ({}), repooling {} tests",
+                    exit_info, unaccounted_tests.len()).dimmed()
             );
-            if !tests_to_repool.is_empty() {
-                eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
+            for test in &unaccounted_tests {
+                ctx.work_pool.add_file(test.clone());
             }
-            ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
-            let failure_msg = if killed_for_timeout {
-                format!("Test timed out ({})", exit_info)
-            } else {
-                format!("Test caused slang-test to crash ({})", exit_info)
-            };
-            ctx.failures.lock().unwrap().push(FailureInfo {
-                test_name: test.clone(),
-                output_lines: vec![failure_msg],
-                expected: None,
-                actual: None,
-            });
-
-            // Record timing for crashed/timed-out test using actual elapsed time
-            // This helps scheduling know this test is slow/problematic
-            let test_id = TestId::parse(&test);
-            let timing_key = test_id.to_timing_key();
-            ctx.stats.record_observed_timing(&timing_key, loop_time.as_secs_f64());
         }
     }
 
