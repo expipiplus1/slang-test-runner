@@ -998,8 +998,12 @@ impl Scheduler {
 
         let mut batches = Vec::new();
 
-        // Helper to build batches from a list of files with a given kind
-        let build_from_files = |files: Vec<String>, kind: BatchKind, batches: &mut Vec<BatchWithKind>| {
+        // Helper to build batches from a list of files with a given kind.
+        // If sort_slowest_first is true, sorts tests by duration before batching
+        // (useful for CPU-only batches where we want slow tests dispatched first).
+        // If false, preserves input order (important for GPU/mixed batches to maintain
+        // the constrained random shuffle that prevents GPU contention).
+        let build_from_files = |files: Vec<String>, kind: BatchKind, sort_slowest_first: bool, batches: &mut Vec<BatchWithKind>| {
             if files.is_empty() {
                 return;
             }
@@ -1007,14 +1011,16 @@ impl Scheduler {
             let mut files = files;
 
             if has_timing_data {
-                // Sort by predicted duration, slowest first
-                files.sort_by(|a, b| {
-                    let dur_a = predictions.get(a).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                    let dur_b = predictions.get(b).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                    dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                if sort_slowest_first {
+                    // Sort by predicted duration, slowest first
+                    files.sort_by(|a, b| {
+                        let dur_a = predictions.get(a).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                        let dur_b = predictions.get(b).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                        dur_b.partial_cmp(&dur_a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
 
-                // Build batches: slow tests get their own batch, fast tests are grouped
+                // Build batches using duration-based grouping
                 let mut current_batch = Vec::new();
                 let mut current_duration = 0.0;
 
@@ -1073,17 +1079,22 @@ impl Scheduler {
         };
 
         if gpu_jobs.is_some() {
-            // Build separate GPU and CPU batches
-            build_from_files(gpu_files, BatchKind::Gpu, &mut batches);
-            build_from_files(cpu_files, BatchKind::Cpu, &mut batches);
+            // Segmented mode: separate GPU and CPU batches
+            // GPU batches: preserve random order (constrained shuffle handles long-pole)
+            build_from_files(gpu_files, BatchKind::Gpu, false, &mut batches);
+
+            // CPU batches: sort slowest-first, then reverse so slow batches are at the
+            // end of the vector and get .pop()'d first
+            let cpu_start_idx = batches.len();
+            build_from_files(cpu_files, BatchKind::Cpu, true, &mut batches);
+            batches[cpu_start_idx..].reverse();
         } else {
-            // No GPU limiting - all batches are Mixed
-            build_from_files(cpu_files, BatchKind::Mixed, &mut batches);
+            // Mixed mode: preserve the constrained random order from the shuffle.
+            // The shuffle already prevents slow tests from clustering at the end
+            // while keeping GPU tests randomly distributed to avoid contention.
+            build_from_files(cpu_files, BatchKind::Mixed, false, &mut batches);
         }
 
-        // Don't sort batches - rely on random input order to spread GPU tests
-        // and tail prioritization (in try_get_batch) to handle slow tests at the end.
-        // Sorting by duration front-loads slow GPU tests, causing contention.
         batches
     }
 
@@ -1613,10 +1624,10 @@ impl ProgressDisplay {
             // Format ETA string (velocity-adjusted)
             let eta = match adjusted_eta {
                 Some(secs) if secs > 1.0 && tests_remaining > 0 => {
-                    format!(" | ETA: {:.1}s", secs)
+                    format!(" \x1b[2m|\x1b[0m ETA: {:.1}s", secs)
                 }
                 Some(_) if tests_remaining > 0 => {
-                    " | ETA: <1s".to_string()
+                    " \x1b[2m|\x1b[0m ETA: <1s".to_string()
                 }
                 _ => String::new(),
             };
@@ -1639,8 +1650,8 @@ impl ProgressDisplay {
 
             let load_info = if self.verbose {
                 match self.last_gpu_load {
-                    Some(gpu) => format!(" | CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
-                    None if self.last_cpu_load > 0.0 => format!(" | CPU: {:.0}%", self.last_cpu_load),
+                    Some(gpu) => format!(" \x1b[2m|\x1b[0m CPU: {:.0}% GPU: {}%", self.last_cpu_load, gpu),
+                    None if self.last_cpu_load > 0.0 => format!(" \x1b[2m|\x1b[0m CPU: {:.0}%", self.last_cpu_load),
                     None => String::new(),
                 }
             } else {
@@ -1648,7 +1659,7 @@ impl ProgressDisplay {
             };
 
             let msg = format!(
-                "[{}/{}/{}] {:.1}% | {} passed, {} failed, {} ignored | Elapsed: {:.1}s{}{}{}{}",
+                "[{}/{}/{}] {:.1}% \x1b[2m|\x1b[0m {} passed, {} failed, {} ignored \x1b[2m|\x1b[0m Elapsed: {:.1}s{}{}{}{}",
                 batches_running, tests_remaining, self.total_files,
                 percent, passed, failed, ignored, elapsed,
                 eta, load_info, compiling_info, stuck_info
