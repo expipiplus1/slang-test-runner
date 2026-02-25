@@ -2,43 +2,47 @@
 
 A wrapper for slang-test which implements several enhancements:
 
-- Parallelized test running
-- More user friendly output, during test running and as a final report
-- Robust handling of segfaults or unexpected crashes
-- Automatic retries of transiently failing tests
+- More robust parallelized test running
+- Better test scheduling for faster running
+  - Especially from the second run onwards once we have learned which tests are
+    slow
+- More user friendly output
+- Graceful handling of segfaults or unexpected crashes
+- Estimated time to completion
 
 ## Usage
 
 ```bash
-# Run all tests from the slang directory
-sti -C /path/to/slang
+# Run all tests in the current directory
+sti
 
 # Run tests matching a regex filter (infix match)
-sti -C /path/to/slang diagnostic
+sti diagnostic
 
 # Run tests matching a prefix
-sti -C /path/to/slang '^tests/compute'
+sti '^tests/compute'
 
-# Run multiple filter patterns (union - matches ANY)
-sti -C /path/to/slang '^tests/compute' '^tests/autodiff'
+# Run multiple filter patterns
+sti '^tests/compute' '^tests/autodiff'
 
 # Run internal unit tests
-sti -C /path/to/slang slang-unit-test-tool
+sti slang-unit-test-tool
 
 # List tests that would be run without running them
-sti -C /path/to/slang --dry-run diagnostic
+sti --dry-run diagnostic
 
 # Customize parallelism
-sti -C /path/to/slang -j 8 '^tests/compute'
+sti -j 8
 
 # Use difft for side-by-side diffs
-sti -C /path/to/slang --diff difft '^tests/compute'
+sti --diff difft
 
 # Ignore tests matching a pattern
-sti -C /path/to/slang --ignore 'cuda' --ignore 'metal'
+sti --ignore 'compute'
 
-# Pass extra arguments to slang-test
-sti -C /path/to/slang '^tests/compute' -- -api vk
+# Specific APIs
+sti --api vk
+sti --ignore-api cuda
 ```
 
 ## Options
@@ -50,6 +54,8 @@ sti -C /path/to/slang '^tests/compute' -- -api vk
 - `-j, --jobs <N>` - Number of parallel workers (default: number of CPUs)
 - `--dry-run` - List tests that would be run without actually running them
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
+- `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
+- `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
 - `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
 - `-v, --verbose` - Verbose output: show batch reproduction commands for slow batches, extended slow-test report with per-backend timing
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
@@ -68,6 +74,7 @@ sti -C /path/to/slang '^tests/compute' -- -api vk
 - `--no-timing-cache` - Ignore cached timing data for scheduling and ETA
 - `--adaptive` - Adaptive load balancing: spawn extra workers when CPU is underutilized
 - `--event-log <PATH>` - Write CSV event log for performance debugging
+- `--timeout <SECS>` - Timeout per test batch in seconds (default: 600 = 10 minutes)
 
 When stderr is not a TTY (e.g., in CI or when piped), output automatically switches to machine-readable format: no carriage returns, no terminal clearing, sparse progress updates.
 
@@ -105,7 +112,7 @@ When slang-test crashes (segfault, timeout, or abnormal exit), the runner uses t
 
 1. **Exit code analysis**: Normal completion returns exit code 0 (all pass) or 1 (some failures). Any other exit code (e.g., 139 for segfault) indicates a crash.
 
-2. **Timeout detection**: If a batch exceeds the 5-minute timeout, the process is killed and treated as a crash.
+2. **Timeout detection**: If a batch exceeds the timeout (default 10 minutes, configurable via `--timeout`), the process is killed and the test is marked as failed.
 
 ### How the crashing test is identified
 

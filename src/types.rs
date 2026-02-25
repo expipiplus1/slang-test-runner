@@ -166,8 +166,6 @@ impl Ord for TestId {
 // Constants
 pub const DEFAULT_PREDICTED_DURATION: f64 = 0.5;
 pub const EMA_NEW_WEIGHT: f64 = 0.7;
-pub const EMA_OLD_WEIGHT: f64 = 0.3;
-pub const BATCH_TIMEOUT_SECS: u64 = 300;
 pub const OUTPUT_TRUNCATE_LINES: usize = 30;
 
 // ============================================================================
@@ -305,7 +303,7 @@ impl TimingCache {
         if *existing == 0.0 {
             *existing = duration;
         } else {
-            *existing = duration * EMA_NEW_WEIGHT + *existing * EMA_OLD_WEIGHT;
+            *existing = duration * EMA_NEW_WEIGHT + *existing * (1.0 - EMA_NEW_WEIGHT);
         }
     }
 

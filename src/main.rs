@@ -61,6 +61,16 @@ pub struct Args {
     #[arg(long = "ignore")]
     pub ignore_patterns: Vec<String>,
 
+    /// Only run tests for specific APIs (union: test runs if it matches ANY specified API)
+    /// Examples: --api vk --api cuda
+    #[arg(long = "api")]
+    pub apis: Vec<String>,
+
+    /// Exclude tests for specific APIs (union: test is excluded if it matches ANY specified API)
+    /// Examples: --ignore-api vk --ignore-api metal
+    #[arg(long = "ignore-api")]
+    pub ignore_apis: Vec<String>,
+
     /// Diff tool for showing expected/actual differences: none, diff, difft (default: diff)
     #[arg(long, default_value = "diff")]
     pub diff: String,
@@ -88,6 +98,10 @@ pub struct Args {
     /// List tests that would be run without actually running them
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Timeout per test batch in seconds (default: 600 = 10 minutes)
+    #[arg(long, default_value_t = 600)]
+    pub timeout: u64,
 }
 
 // ============================================================================
@@ -116,24 +130,34 @@ pub fn discover_tests_via_dry_run(
     root_dir: &PathBuf,
     filters: &[String],
     ignore_patterns: &[String],
+    apis: &[String],
+    ignore_apis: &[String],
 ) -> Result<Vec<String>> {
-    let rx = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns)?;
+    let (rx, error_rx) = discover_tests_streaming(slang_test, root_dir, filters, ignore_patterns, apis, ignore_apis)?;
     let mut tests: Vec<String> = rx.iter().collect();
+    // Check for errors after iteration completes
+    if let Ok(error_msg) = error_rx.try_recv() {
+        anyhow::bail!("{}", error_msg);
+    }
     tests.sort();
     Ok(tests)
 }
 
 /// Discover tests using slang-test -dry-run, streaming results via channel
 /// Tests are sent as they are discovered, unsorted
+/// Returns (test_receiver, error_receiver) - check error_receiver after iteration
 pub fn discover_tests_streaming(
     slang_test: &PathBuf,
     root_dir: &PathBuf,
     filters: &[String],
     ignore_patterns: &[String],
-) -> Result<crossbeam_channel::Receiver<String>> {
+    apis: &[String],
+    ignore_apis: &[String],
+) -> Result<(crossbeam_channel::Receiver<String>, crossbeam_channel::Receiver<String>)> {
     use regex::Regex;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+    use types::TestId;
 
     // Compile filter regexes upfront
     let filter_regexes: Vec<Regex> = filters
@@ -145,6 +169,13 @@ pub fn discover_tests_streaming(
         .iter()
         .map(|p| Regex::new(p).with_context(|| format!("Invalid ignore regex: {}", p)))
         .collect::<Result<Vec<_>>>()?;
+
+    // Clone API filters for the thread
+    let apis: Vec<String> = apis.to_vec();
+    let ignore_apis: Vec<String> = ignore_apis.to_vec();
+
+    // Log the dry-run invocation
+    log_event("dry_run", &format!("{} -dry-run -skip-api-detection", slang_test.display()));
 
     // Try to use stdbuf to force line-buffering (avoids delay waiting for "no tests run")
     // Falls back to running slang-test directly if stdbuf isn't available
@@ -158,7 +189,7 @@ pub fn discover_tests_streaming(
                 .arg("-skip-api-detection")
                 .current_dir(root_dir)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn();
 
             match stdbuf_result {
@@ -170,7 +201,7 @@ pub fn discover_tests_streaming(
                         .arg("-skip-api-detection")
                         .current_dir(root_dir)
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
+                        .stderr(Stdio::piped())
                         .spawn()
                         .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
                     (child, false)
@@ -184,7 +215,7 @@ pub fn discover_tests_streaming(
                 .arg("-skip-api-detection")
                 .current_dir(root_dir)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .with_context(|| format!("Failed to run {} -dry-run", slang_test.display()))?;
             (child, false)
@@ -193,7 +224,29 @@ pub fn discover_tests_streaming(
     let _ = using_stdbuf; // suppress unused warning
 
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
+    let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
+
+    // Spawn a thread to check stderr for "unknown option" error (old slang-test)
+    let stderr_error_tx = error_tx.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if line.contains("unknown option") && line.contains("-dry-run") {
+                    let _ = stderr_error_tx.send(
+                        "Your slang-test is too old and does not support the -dry-run option. \
+                         Please update to a newer version of slang.".to_string()
+                    );
+                    return;
+                }
+            }
+        }
+    });
+
+    // Label for reaper logging
+    let reaper_label = format!("dry_run:{}", slang_test.display());
 
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -206,7 +259,7 @@ pub fn discover_tests_streaming(
 
             // "no tests run" means we're done - send to reaper and return immediately
             if line == "no tests run" {
-                runner::reap_process(child);
+                runner::reap_process_with_label(child, reaper_label);
                 return;
             }
 
@@ -230,16 +283,43 @@ pub fn discover_tests_streaming(
                 continue;
             }
 
+            // Apply API filters
+            let test_id = TestId::parse(line);
+            let test_api = test_id.api.as_deref();
+
+            // If --api is specified, only include tests matching one of the APIs
+            if !apis.is_empty() {
+                match test_api {
+                    Some(api) if apis.iter().any(|a| a.eq_ignore_ascii_case(api)) => {}
+                    _ => continue, // Skip tests without API or with non-matching API
+                }
+            }
+
+            // If --ignore-api is specified, exclude tests matching any of the APIs
+            if !ignore_apis.is_empty() {
+                if let Some(api) = test_api {
+                    if ignore_apis.iter().any(|a| a.eq_ignore_ascii_case(api)) {
+                        continue;
+                    }
+                }
+            }
+
             if tx.send(line.to_string()).is_err() {
                 break;
             }
         }
 
         // Send to reaper for async cleanup instead of blocking on wait
-        runner::reap_process(child);
+        runner::reap_process_with_label(child, reaper_label);
     });
 
-    Ok(rx)
+    // Check immediately if there's an error (give it a moment to detect)
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Ok(error_msg) = error_rx.try_recv() {
+        anyhow::bail!("{}", error_msg);
+    }
+
+    Ok((rx, error_rx))
 }
 
 fn detect_slang_test_build(
@@ -305,6 +385,19 @@ fn main() -> Result<()> {
 
     let mut args = Args::parse();
 
+    // Validate API filter combinations
+    if !args.apis.is_empty() && !args.ignore_apis.is_empty() {
+        // Check for overlap - it's nonsense to both include and exclude the same API
+        for api in &args.apis {
+            if args.ignore_apis.iter().any(|a| a.eq_ignore_ascii_case(api)) {
+                anyhow::bail!(
+                    "Conflicting API filters: '{}' appears in both --api and --ignore-api",
+                    api
+                );
+            }
+        }
+    }
+
     if let Some(ref log_path) = args.event_log {
         init_event_log(log_path)?;
         log_event(
@@ -363,17 +456,24 @@ fn main() -> Result<()> {
             .to_lowercase()
             .contains("debug");
 
-        let rx = discover_tests_streaming(
+        let (rx, error_rx) = discover_tests_streaming(
             &slang_test_path,
             &root_dir,
             &args.filters,
             &args.ignore_patterns,
+            &args.apis,
+            &args.ignore_apis,
         )?;
 
         let mut count = 0;
         let mut shown_compiling = false;
 
         loop {
+            // Check for errors from the discovery thread
+            if let Ok(error_msg) = error_rx.try_recv() {
+                anyhow::bail!("{}", error_msg);
+            }
+
             // Try to receive with a timeout so we can show compiling message while waiting
             match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(test) => {
@@ -395,7 +495,10 @@ fn main() -> Result<()> {
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    // Channel closed, we're done
+                    // Channel closed - check for errors one more time
+                    if let Ok(error_msg) = error_rx.try_recv() {
+                        anyhow::bail!("{}", error_msg);
+                    }
                     if shown_compiling && count == 0 && is_tty {
                         eprint!("\r\x1b[K");
                     }

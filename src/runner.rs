@@ -23,13 +23,26 @@ static COMPILING_CORE: AtomicBool = AtomicBool::new(false);
 // Process Reaper - cleans up finished processes without blocking
 // ============================================================================
 
-static REAPER_TX: LazyLock<crossbeam_channel::Sender<std::process::Child>> = LazyLock::new(|| {
-    let (tx, rx) = crossbeam_channel::unbounded::<std::process::Child>();
+/// A process sent to the reaper, with an optional label for logging
+struct ReaperItem {
+    child: std::process::Child,
+    label: Option<String>,
+}
+
+static REAPER_TX: LazyLock<crossbeam_channel::Sender<ReaperItem>> = LazyLock::new(|| {
+    let (tx, rx) = crossbeam_channel::unbounded::<ReaperItem>();
 
     thread::spawn(move || {
-        while let Ok(mut child) = rx.recv() {
-            let _ = child.kill();
-            let _ = child.wait();
+        while let Ok(mut item) = rx.recv() {
+            let _ = item.child.kill();
+            let status = item.child.wait();
+            if let Some(label) = item.label {
+                let exit_info = match status {
+                    Ok(s) => format_exit_status(Some(&s)),
+                    Err(e) => format!("wait error: {}", e),
+                };
+                log_event("process_exit", &format!("{} {}", label, exit_info));
+            }
         }
     });
 
@@ -38,7 +51,12 @@ static REAPER_TX: LazyLock<crossbeam_channel::Sender<std::process::Child>> = Laz
 
 /// Send a child process to the reaper for cleanup
 pub fn reap_process(child: std::process::Child) {
-    let _ = REAPER_TX.send(child);
+    let _ = REAPER_TX.send(ReaperItem { child, label: None });
+}
+
+/// Send a child process to the reaper for cleanup, with a label for logging
+pub fn reap_process_with_label(child: std::process::Child, label: String) {
+    let _ = REAPER_TX.send(ReaperItem { child, label: Some(label) });
 }
 
 pub fn is_compiling_core() -> bool {
@@ -520,6 +538,7 @@ pub fn run_batch_with_pool(
     let start = Instant::now();
     let mut this_batch_is_compiling = false;
     let mut killed_for_compilation = false;
+    let mut killed_for_timeout = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
 
     loop {
@@ -580,6 +599,7 @@ pub fn run_batch_with_pool(
             Ok(None) => {
                 if start.elapsed() > ctx.timeout {
                     let _ = child.kill();
+                    killed_for_timeout = true;
                     break;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -658,32 +678,57 @@ pub fn run_batch_with_pool(
         }
     }
 
-    // Detect crash: if we didn't see the summary and weren't interrupted/killed for compilation
+    // Detect crash or timeout: if we didn't see the summary and weren't interrupted/killed for compilation
     if !saw_summary && !is_interrupted() && !killed_for_compilation {
-        let exit_info = format_exit_status(exit_status.as_ref());
+        let exit_info = if killed_for_timeout {
+            format!("timeout after {}s", ctx.timeout.as_secs())
+        } else {
+            format_exit_status(exit_status.as_ref())
+        };
 
-        // Since tests are now individual (with variant numbers), the crash must be
+        // Since tests are now individual (with variant numbers), the crash/timeout must be
         // caused by the first test we didn't see output for
         let mut crashed_test: Option<String> = None;
+        let mut tests_to_repool: Vec<String> = Vec::new();
+        let mut found_crashed = false;
 
         for file in ctx.test_files {
             let test_id = TestId::parse(file);
             let timing_key = test_id.to_timing_key();
             if !seen_tests.contains(&timing_key) {
-                crashed_test = Some(file.clone());
-                break;
+                if !found_crashed {
+                    crashed_test = Some(file.clone());
+                    found_crashed = true;
+                } else {
+                    // All tests after the crashed/timed-out one should be repooled
+                    tests_to_repool.push(file.clone());
+                }
             }
         }
 
+        // Repool tests that didn't get a chance to run
+        for test in &tests_to_repool {
+            ctx.work_pool.add_file(test.clone());
+        }
+
         if let Some(test) = crashed_test {
+            let error_type = if killed_for_timeout { "timed out" } else { "crashed" };
             eprintln!(
-                "\nERROR: slang-test crashed ({}), skipping: {}",
-                exit_info, test
+                "\nERROR: slang-test {} ({}), skipping: {}",
+                error_type, exit_info, test
             );
+            if !tests_to_repool.is_empty() {
+                eprintln!("  Repooling {} subsequent tests", tests_to_repool.len());
+            }
             ctx.stats.failed.fetch_add(1, Ordering::SeqCst);
+            let failure_msg = if killed_for_timeout {
+                format!("Test timed out ({})", exit_info)
+            } else {
+                format!("Test caused slang-test to crash ({})", exit_info)
+            };
             ctx.failures.lock().unwrap().push(FailureInfo {
                 test_name: test.clone(),
-                output_lines: vec![format!("Test caused slang-test to crash ({})", exit_info)],
+                output_lines: vec![failure_msg],
                 expected: None,
                 actual: None,
             });
@@ -748,11 +793,13 @@ impl TestRunner {
         }
 
         // Discover tests via slang-test -dry-run (streaming)
-        let rx = crate::discover_tests_streaming(
+        let (rx, error_rx) = crate::discover_tests_streaming(
             self.args.slang_test.as_ref().unwrap(),
             &self.args.root_dir,
             &self.args.filters,
             &self.args.ignore_patterns,
+            &self.args.apis,
+            &self.args.ignore_apis,
         )?;
 
         // Collect tests while showing streaming progress (in TTY mode)
@@ -761,6 +808,10 @@ impl TestRunner {
         let mut total_predicted: f64 = 0.0;
 
         for test in rx {
+            // Check for errors from the discovery thread
+            if let Ok(error_msg) = error_rx.try_recv() {
+                anyhow::bail!("{}", error_msg);
+            }
             // Check if cache finished loading (non-blocking)
             if cache_for_display.is_none() {
                 if let Ok(cache) = cache_rx.try_recv() {
@@ -806,6 +857,11 @@ impl TestRunner {
         if !self.machine_output && !test_files.is_empty() {
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
+        }
+
+        // Check for errors after discovery completes
+        if let Ok(error_msg) = error_rx.try_recv() {
+            anyhow::bail!("{}", error_msg);
         }
 
         // Wait for cache loading to complete if not already done
@@ -966,6 +1022,8 @@ impl TestRunner {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
 
+        let timeout = Duration::from_secs(self.args.timeout);
+
         if !work_pool.is_empty() {
             for _ in 0..self.args.jobs {
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
@@ -990,7 +1048,7 @@ impl TestRunner {
                                 &slang_test,
                                 &batch,
                                 &extra_args,
-                                Duration::from_secs(BATCH_TIMEOUT_SECS),
+                                timeout,
                                 &stats,
                                 &failures,
                                 retries,
@@ -1056,7 +1114,7 @@ impl TestRunner {
                                         &slang_test,
                                         &batch,
                                         &extra_args,
-                                        Duration::from_secs(BATCH_TIMEOUT_SECS),
+                                        timeout,
                                         &stats,
                                         &failures,
                                         retries,
