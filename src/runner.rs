@@ -27,29 +27,51 @@ use crate::types::{
 // Diff Tool Resolution
 // ============================================================================
 
-/// Check if difft is available (cached)
-static DIFFT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-    Command::new("difft")
-        .arg("--version")
+/// Check if a command is available (cached)
+fn is_command_available(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd)
+        .args(args)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-});
+}
+
+static DIFFT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("difft", &["--version"]));
+static GIT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("git", &["--version"]));
+static DIFF_AVAILABLE: LazyLock<bool> = LazyLock::new(|| is_command_available("diff", &["--version"]));
 
 /// Get terminal width for diff output (cached at startup, None if not a TTY)
 /// Subtracts 2 for the indent prefix added to diff output
-static TERM_WIDTH: LazyLock<Option<String>> = LazyLock::new(|| {
-    terminal_size().map(|(Width(w), _)| w.saturating_sub(2).to_string())
+static TERM_WIDTH: LazyLock<Option<usize>> = LazyLock::new(|| {
+    terminal_size().map(|(Width(w), _)| w.saturating_sub(2) as usize)
 });
 
-/// Resolve "auto" diff tool to actual tool name
+/// Strip leading ANSI escape codes from a string (for line matching)
+fn strip_ansi_prefix(s: &str) -> &str {
+    let mut rest = s;
+    while rest.starts_with("\x1b[") {
+        if let Some(end) = rest.find('m') {
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// Resolve "auto" diff tool to actual tool name.
+/// Fallback chain: difft → git → diff → none
 fn resolve_diff_tool(tool: &str) -> &str {
     match tool {
         "auto" => {
             if *DIFFT_AVAILABLE {
                 "difft"
-            } else {
+            } else if *GIT_AVAILABLE {
+                "git"
+            } else if *DIFF_AVAILABLE {
                 "diff"
+            } else {
+                "none"
             }
         }
         other => other,
@@ -1666,7 +1688,9 @@ impl TestRunner {
         }
     }
 
-    fn compute_external_diff(cmd: &str, args: &[&str], expected: &str, actual: &str, machine_output: bool) -> String {
+    /// Compute diff output for the given tool.
+    /// Handles: difft, git, diff (unified), with appropriate line filtering.
+    fn compute_diff(tool: &str, expected: &str, actual: &str, machine_output: bool) -> String {
         use std::io::Write as _;
 
         let indent = if machine_output { "" } else { "  " };
@@ -1685,27 +1709,64 @@ impl TestRunner {
             let _ = ef.write_all(expected.as_bytes());
             let _ = af.write_all(actual.as_bytes());
 
-            let output = Command::new(cmd)
-                .args(args)
-                .arg(&expected_file)
-                .arg(&actual_file)
-                .output();
+            // Build command based on tool
+            let output = match tool {
+                "difft" => {
+                    let mut cmd = Command::new("difft");
+                    cmd.arg("--color").arg("always");
+                    if let Some(w) = *TERM_WIDTH {
+                        if !machine_output {
+                            cmd.arg("--width").arg(w.to_string());
+                        }
+                    }
+                    cmd.arg(&expected_file).arg(&actual_file).output()
+                }
+                "git" => {
+                    Command::new("git")
+                        .args(["--no-pager", "diff", "--no-ext-diff", "--no-index", "--color=always"])
+                        .arg(&expected_file)
+                        .arg(&actual_file)
+                        .output()
+                }
+                _ => {
+                    // diff -u
+                    Command::new("diff")
+                        .args(["-u", "--color=always"])
+                        .arg(&expected_file)
+                        .arg(&actual_file)
+                        .output()
+                }
+            };
 
             match output {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let expected_path = expected_file.to_string_lossy();
-                    let actual_path = actual_file.to_string_lossy();
                     for line in stdout.lines() {
-                        // Skip difft file header lines (e.g., "/tmp/slang-test-actual-123.txt --- Text")
-                        if line.starts_with(expected_path.as_ref()) || line.starts_with(actual_path.as_ref()) {
+                        // Skip file header lines containing our temp file names:
+                        // - difft: "/tmp/slang-test-actual-123.txt --- Text"
+                        // - git/diff -u: "--- /tmp/slang-test-..." and "+++ /tmp/slang-test-..."
+                        if line.contains("slang-test-expected-") || line.contains("slang-test-actual-") {
+                            continue;
+                        }
+                        // Skip unified diff file headers (--- and +++ lines)
+                        if line.starts_with("--- ") || line.starts_with("+++ ") {
+                            continue;
+                        }
+                        // Skip "\ No newline at end of file" and similar messages
+                        if line.starts_with("\\ ") {
+                            continue;
+                        }
+                        // Also skip git's "diff --git" and "index" lines
+                        // Strip ANSI codes for matching (they start with ESC[)
+                        let stripped = strip_ansi_prefix(line);
+                        if stripped.starts_with("diff --git") || stripped.starts_with("index ") {
                             continue;
                         }
                         result.push_str(&format!("{}{}\n", indent, line));
                     }
                 }
                 Err(_) => {
-                    result.push_str(&format!("{}({} not available, showing raw output)\n", indent, cmd));
+                    result.push_str(&format!("{}({} not available, showing raw output)\n", indent, tool));
                     result.push_str(&format!("{}Expected:\n", indent));
                     for line in expected.lines() {
                         result.push_str(&format!("{}  {}\n", indent, line));
@@ -1775,14 +1836,7 @@ impl TestRunner {
                             let actual = actual.clone();
                             let tool = diff_tool.to_string();
                             Some(thread::spawn(move || {
-                                let (cmd, args): (&str, Vec<&str>) = if tool == "difft" {
-                                    ("difft", vec!["--color", "always"])
-                                } else if let Some(w) = TERM_WIDTH.as_ref().filter(|_| !machine_output) {
-                                    ("diff", vec!["-y", "--color=always", "-t", "-W", w])
-                                } else {
-                                    ("diff", vec!["-y", "--color=always", "-t"])
-                                };
-                                Self::compute_external_diff(cmd, &args, &expected, &actual, machine_output)
+                                Self::compute_diff(&tool, &expected, &actual, machine_output)
                             }))
                         } else {
                             None

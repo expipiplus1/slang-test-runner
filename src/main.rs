@@ -84,7 +84,8 @@ pub struct Args {
     #[arg(long = "ignore-api")]
     pub ignore_apis: Vec<String>,
 
-    /// Diff tool for showing expected/actual differences: none, diff, difft, auto (default: auto, prefers difft if available)
+    /// Diff tool for showing expected/actual differences: difft, git, diff, none, auto
+    /// (default: auto, fallback chain: difft → git → diff → none)
     #[arg(long, default_value = "auto")]
     pub diff: String,
 
