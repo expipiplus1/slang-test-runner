@@ -66,10 +66,6 @@ pub struct Args {
     #[arg()]
     pub filters: Vec<String>,
 
-    /// Hide ignored tests from output
-    #[arg(long)]
-    pub hide_ignored: bool,
-
     /// Ignore patterns as regexes (union: test is ignored if it matches ANY pattern)
     #[arg(long = "ignore")]
     pub ignore_patterns: Vec<String>,
