@@ -20,8 +20,8 @@ use types::{flush_event_log, init_event_log, log_event, UnsupportedApis};
 #[command(about = "A parallel test runner for slang-test with better output")]
 pub struct Args {
     /// Root directory of the slang project (defaults to current directory)
-    #[arg(short = 'C', long, default_value = ".")]
-    pub root_dir: PathBuf,
+    #[arg(short = 'C', long)]
+    pub root_dir: Option<PathBuf>,
 
     /// Path to slang-test executable (relative to root_dir or absolute)
     /// If not specified, auto-detects the newest build
@@ -77,8 +77,8 @@ pub struct Args {
     #[arg(long = "ignore-api")]
     pub ignore_apis: Vec<String>,
 
-    /// Diff tool for showing expected/actual differences: none, diff, difft (default: diff)
-    #[arg(long, default_value = "diff")]
+    /// Diff tool for showing expected/actual differences: none, diff, difft, auto (default: auto, prefers difft if available)
+    #[arg(long, default_value = "auto")]
     pub diff: String,
 
     /// Additional arguments to pass to slang-test
@@ -116,6 +116,19 @@ pub struct Args {
     /// unsupported APIs early.
     #[arg(long)]
     pub no_early_api_check: bool,
+
+    // ---- Internal fields (not CLI args) ----
+    /// The original -C argument as provided (for rerun command)
+    #[arg(skip)]
+    pub root_dir_original: Option<String>,
+
+    /// The original --slang-test argument as provided (for rerun command)
+    #[arg(skip)]
+    pub slang_test_original: Option<String>,
+
+    /// The effective root directory (resolved from root_dir or default ".")
+    #[arg(skip)]
+    pub root_dir_effective: PathBuf,
 }
 
 // ============================================================================
@@ -157,6 +170,42 @@ pub fn discover_tests_via_dry_run(
     Ok(tests)
 }
 
+/// Convert a filter string to a regex pattern.
+///
+/// Special handling for file paths with variant suffixes:
+/// - `tests/foo.slang` -> matches all variants (prefix match)
+/// - `tests/foo.slang.0` -> matches only variant 0 (anchored match)
+/// - `tests/foo.slang.12` -> matches only variant 12 (anchored match)
+/// - Other patterns -> treated as raw regex
+fn filter_to_regex_pattern(filter: &str) -> String {
+    let extensions = [".slang", ".hlsl", ".glsl", ".c", ".internal"];
+
+    // Find if this has a file extension
+    for ext in &extensions {
+        if let Some(ext_pos) = filter.rfind(ext) {
+            let after_ext = &filter[ext_pos + ext.len()..];
+
+            if after_ext.is_empty() {
+                // Ends with extension (e.g., "tests/foo.slang") - escape for literal prefix match
+                return regex::escape(filter);
+            } else if after_ext.starts_with('.') {
+                // Has something after extension - check if it's a variant number
+                let potential_variant = &after_ext[1..];
+                if !potential_variant.is_empty() && potential_variant.chars().all(|c| c.is_ascii_digit()) {
+                    // This is a variant suffix (e.g., "tests/foo.slang.0")
+                    // Create anchored pattern that matches this variant only
+                    // Must be followed by space (for " syn" or " (api)") or end of string
+                    let escaped = regex::escape(filter);
+                    return format!("^{}( |$)", escaped);
+                }
+            }
+        }
+    }
+
+    // Not a recognized file path pattern - use as raw regex
+    filter.to_string()
+}
+
 /// Discover tests using slang-test -dry-run, streaming results via channel
 /// Tests are sent as they are discovered, unsorted
 /// Returns (test_receiver, error_receiver, compiling_receiver) - check error_receiver after iteration
@@ -174,10 +223,13 @@ pub fn discover_tests_streaming(
     use std::process::{Command, Stdio};
     use types::TestId;
 
-    // Compile filter regexes upfront
+    // Compile filter regexes upfront, with special handling for file path patterns
     let filter_regexes: Vec<Regex> = filters
         .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("Invalid filter regex: {}", p)))
+        .map(|p| {
+            let pattern = filter_to_regex_pattern(p);
+            Regex::new(&pattern).with_context(|| format!("Invalid filter regex: {}", p))
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let ignore_regexes: Vec<Regex> = ignore_patterns
@@ -416,14 +468,19 @@ fn main() -> Result<()> {
         );
     }
 
-    let root_dir = args.root_dir.canonicalize().unwrap_or(args.root_dir.clone());
+    // Handle root_dir: save original for rerun command, then resolve effective path
+    args.root_dir_original = args.root_dir.as_ref().map(|p| p.to_string_lossy().to_string());
+    let root_dir_input = args.root_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    let root_dir = root_dir_input.canonicalize().unwrap_or(root_dir_input);
+    args.root_dir_effective = root_dir.clone();
 
-    let slang_test_path = if let Some(path) = args.slang_test {
-        if path.is_relative() {
-            root_dir.join(&path)
-        } else {
-            path
-        }
+    // Save original --slang-test for rerun command
+    args.slang_test_original = args.slang_test.as_ref().map(|p| p.to_string_lossy().to_string());
+
+    let slang_test_path = if let Some(path) = args.slang_test.take() {
+        // User explicitly specified a path - use it as-is
+        // (let Command::new handle PATH lookup for bare names like "slang-test")
+        path
     } else {
         let (path, build_type, available) =
             detect_slang_test_build(&root_dir, args.build_type.as_deref())?;
@@ -452,7 +509,6 @@ fn main() -> Result<()> {
     };
 
     args.slang_test = Some(slang_test_path.clone());
-    args.root_dir = root_dir.clone();
 
     // Start early API detection (unless disabled)
     let api_check_rx = if !args.no_early_api_check {
@@ -482,7 +538,7 @@ fn main() -> Result<()> {
 
         let (rx, error_rx, compiling_rx) = discover_tests_streaming(
             &slang_test_path,
-            &args.root_dir,
+            &args.root_dir_effective,
             &args.filters,
             &args.ignore_patterns,
             &args.apis,

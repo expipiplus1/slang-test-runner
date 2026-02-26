@@ -1,11 +1,34 @@
 # Slang Test Interceptor
 
-A wrapper for slang-test which implements several enhancements:
+A wrapper for slang-test which implements several enhancements.
 
-- More robust parallelized test running
-- Better test scheduling for faster running
-  - Especially from the second run onwards once we have learned which tests are
-    slow
+> All stats and findings are from my machine, 7950X3D, 96GB, RTX 4090, Linux.
+
+## It's more robust than `slang-test`.
+
+`slang-test -j32` reliably fails before completing the test suite when one of the test servers dies unexpectedly.
+
+`sti` will detect the crash of a worker and reschedule any unaccounted for tests, marking the crashing test as failed.
+
+## It's much faster than `slang-test`.
+
+|                     | `slang-test` | `sti`       |
+| ------------------- | ------------ | ----------- |
+| `-j24`              | 88s          | 40s         |
+| `-j1 tests/compute` | 22.5s        | 15.5s **!** |
+
+This is mainly due to better scheduling and more aggressive management of workers. There are a bunch of tricks:
+
+- Whenever we run a test we record the time it takes, so in future we can avoid having a 'long-pole' test scheduled right at the end.
+- `slang-test` also seems to do a lot of single-thread waiting in the middle of runs which we avoid.
+- We don't wait for the `slang-test` workers to clean up once they have finished their test, we just kill the process as soon as we see the result of the last test.
+- We try to avoid starting 32 GPU jobs at the same time when we begin to avoid lock contention creating contexts.
+- We do api detection concurrently with test file detection at the beginning.
+
+| slang-test                                        | sti                                 |
+| ------------------------------------------------- | ----------------------------------- |
+| ![slang-test cpu stats in btop](./slang-test.png) | ![sti cpu stats in btop](./sti.png) |
+
 - More user friendly output
 - Graceful handling of segfaults or unexpected crashes
 - Estimated time to completion
@@ -63,7 +86,7 @@ sti -g 0
 - `--ignore <PATTERN>` - Ignore tests matching regex pattern (can be specified multiple times; union: ignored if matches ANY)
 - `--api <API>` - Only run tests for specific APIs (can be specified multiple times; union: runs if matches ANY). Examples: `--api vk --api cuda`
 - `--ignore-api <API>` - Exclude tests for specific APIs (can be specified multiple times; union: excluded if matches ANY). Examples: `--ignore-api metal`
-- `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft` (default: `diff`)
+- `--diff <TOOL>` - Diff tool for expected/actual differences: `none`, `diff`, `difft`, `auto` (default: `auto`, prefers `difft` if available)
 - `-v, --verbose` - Verbose output: show per-worker progress (which test each worker is running), CPU/GPU load, batch reproduction commands for slow batches, slowest tests report, and batch size histogram
 - `-- <ARGS>` - Additional arguments to pass directly to slang-test (e.g., `-- -api vk`)
 

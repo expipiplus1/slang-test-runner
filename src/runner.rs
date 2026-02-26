@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use terminal_size::{terminal_size, Width};
 
 use crate::types::{*, TestId, test_to_timing_key, WorkerState, WorkerStates, Scheduler, SchedulerHandle, UnsupportedApis};
 
@@ -36,6 +37,39 @@ macro_rules! debug_log {
             ).dimmed());
         }
     };
+}
+
+// ============================================================================
+// Diff Tool Resolution
+// ============================================================================
+
+/// Check if difft is available (cached)
+static DIFFT_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+    Command::new("difft")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+});
+
+/// Get terminal width for diff output (cached at startup, None if not a TTY)
+/// Subtracts 2 for the indent prefix added to diff output
+static TERM_WIDTH: LazyLock<Option<String>> = LazyLock::new(|| {
+    terminal_size().map(|(Width(w), _)| w.saturating_sub(2).to_string())
+});
+
+/// Resolve "auto" diff tool to actual tool name
+fn resolve_diff_tool(tool: &str) -> &str {
+    match tool {
+        "auto" => {
+            if *DIFFT_AVAILABLE {
+                "difft"
+            } else {
+                "diff"
+            }
+        }
+        other => other,
+    }
 }
 
 // ============================================================================
@@ -496,6 +530,52 @@ pub fn extract_base_test_file(test_name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Minimize a list of failed test names into compact filter patterns.
+/// Groups tests by base file and uses regex alternation for multiple variants.
+/// Examples:
+///   - Single variant: "tests/foo.slang.0"
+///   - Multiple variants: "tests/foo.slang.(0|2|5)"
+pub fn minimize_test_filters(test_names: &[&str]) -> Vec<String> {
+    // Group by base file, tracking variant numbers
+    let mut by_base_file: HashMap<String, Vec<Option<u32>>> = HashMap::new();
+    for name in test_names {
+        let test_id = TestId::parse(name);
+        by_base_file
+            .entry(test_id.path.clone())
+            .or_default()
+            .push(test_id.variant);
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    for (base_path, variants) in &by_base_file {
+        // Deduplicate variants (same variant can fail multiple times with different APIs)
+        let mut unique_variants: Vec<Option<u32>> = variants.iter().copied().collect();
+        unique_variants.sort();
+        unique_variants.dedup();
+
+        if unique_variants.len() > 1 {
+            // Multiple variants - build regex pattern: tests/foo.slang.(0|2|5)
+            let variant_alts: Vec<String> = unique_variants
+                .iter()
+                .filter_map(|v| v.map(|n| n.to_string()))
+                .collect();
+            if !variant_alts.is_empty() {
+                result.push(format!("{}.({})", base_path, variant_alts.join("|")));
+            } else {
+                result.push(base_path.clone());
+            }
+        } else if let Some(Some(variant)) = unique_variants.first() {
+            // Single variant with number
+            result.push(format!("{}.{}", base_path, variant));
+        } else {
+            // No variant number (e.g., internal test)
+            result.push(base_path.clone());
+        }
+    }
+    result.sort();
+    result
+}
+
 // ============================================================================
 // Retry and Outcome Processing
 // ============================================================================
@@ -691,7 +771,10 @@ pub fn run_batch_with_pool(
         .stdout(pipe_writer)
         .stderr(pipe_writer2);
 
-    debug_log!("spawning slang-test for {} tests", ctx.test_files.len());
+    debug_log!("slang-test invocation: {} -explicit-test-order -disable-retries {} {}",
+        ctx.slang_test.display(),
+        slang_test_args.join(" "),
+        ctx.extra_args.join(" "));
     let mut child = match cmd.spawn() {
         Ok(child) => {
             debug_log!("slang-test spawned successfully");
@@ -1165,7 +1248,7 @@ impl TestRunner {
         // Discover tests via slang-test -dry-run (streaming)
         let (rx, error_rx, compiling_rx) = crate::discover_tests_streaming(
             self.args.slang_test.as_ref().unwrap(),
-            &self.args.root_dir,
+            &self.args.root_dir_effective,
             &self.args.filters,
             &self.args.ignore_patterns,
             &self.args.apis,
@@ -1255,13 +1338,15 @@ impl TestRunner {
 
                     // Update progress display (only in TTY mode)
                     if let Some(ref pb) = discovery_pb {
+                        // Cap displayed workers by current test count
+                        let displayed_workers = self.args.jobs.min(test_files.len());
                         let eta = if cache_for_display.is_some() {
-                            let parallel_eta = total_predicted / self.args.jobs as f64;
+                            let parallel_eta = total_predicted / displayed_workers as f64;
                             Some(parallel_eta.max(longest_test))
                         } else {
                             None
                         };
-                        pb.set_message(format_running_message(test_files.len(), self.args.jobs, eta, api_ignored));
+                        pb.set_message(format_running_message(test_files.len(), displayed_workers, eta, api_ignored));
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1355,6 +1440,16 @@ impl TestRunner {
             return Ok(());
         }
 
+        // Cap worker counts to the number of tests - no point having more workers than tests
+        let num_tests = test_files.len();
+        let effective_workers = self.args.jobs.min(num_tests);
+
+        // For GPU workers, cap by number of GPU tests (only when -g is specified)
+        let effective_gpu_jobs = self.args.gpu_jobs.map(|g| {
+            let gpu_test_count = test_files.iter().filter(|t| is_gpu_test(t)).count();
+            g.min(gpu_test_count.max(1))
+        });
+
         let has_timing_data = !self.args.no_timing_cache && self.build_type.is_some() && {
             let cache = self.timing_cache.lock().unwrap();
             self.build_type.map(|bt| cache.has_timing_data(bt)).unwrap_or(false)
@@ -1379,24 +1474,30 @@ impl TestRunner {
         // Compute effective batch_size and batch_duration (0 means auto-calculate)
         // Use predicted parallel runtime (ETA) for batch duration, not total sequential time
         let predicted_runtime = if has_timing_data {
-            calculate_initial_eta(&predictions, self.args.jobs, self.args.gpu_jobs)
+            calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs)
         } else {
             // No timing data - estimate based on default duration
-            (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / self.args.jobs as f64
+            (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / effective_workers as f64
         };
         let effective_batch_size = if self.args.batch_size == 0 {
-            if has_timing_data {
+            if effective_workers == 1 {
+                // Single job: put all tests in one batch (no parallelism benefit from splitting)
+                usize::MAX
+            } else if has_timing_data {
                 // With timing data: 2x tests per worker
-                ((test_files.len() / self.args.jobs) * 2).max(1)
+                ((test_files.len() / effective_workers) * 2).max(1)
             } else {
                 // Without timing data, be conservative: max 50, never more than 1/nworkers
-                50.min(test_files.len() / self.args.jobs).max(1)
+                50.min(test_files.len() / effective_workers).max(1)
             }
         } else {
             self.args.batch_size
         };
         let effective_batch_duration = if self.args.batch_duration == 0.0 {
-            if has_timing_data {
+            if effective_workers == 1 {
+                // Single job: put all tests in one batch (no parallelism benefit from splitting)
+                f64::INFINITY
+            } else if has_timing_data {
                 (predicted_runtime / 2.0).max(1.0)
             } else {
                 // Without timing data, use a conservative fixed duration
@@ -1452,7 +1553,7 @@ impl TestRunner {
 
         // Calculate ETA and fudge factor for display
         let raw_eta = if has_timing_data {
-            Some(calculate_initial_eta(&predictions, self.args.jobs, self.args.gpu_jobs))
+            Some(calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs))
         } else {
             None
         };
@@ -1469,7 +1570,7 @@ impl TestRunner {
 
         // Apply fudge factor to displayed ETA
         let display_eta = raw_eta.map(|eta| eta * fudge_factor);
-        let running_msg = format_running_message(test_files.len(), self.args.jobs, display_eta, api_ignored);
+        let running_msg = format_running_message(test_files.len(), effective_workers, display_eta, api_ignored);
         if let Some(pb) = discovery_pb {
             pb.finish_with_message(running_msg);
         } else {
@@ -1505,6 +1606,9 @@ impl TestRunner {
         // Record initial prediction for fudge factor calculation at end of run
         if let Some(eta) = raw_eta {
             self.stats.record_initial_prediction(eta, test_files.to_vec());
+        } else {
+            // Still need to record test_files for rerun command generation
+            *self.stats.test_files.lock().unwrap() = test_files.to_vec();
         }
 
         if self.args.verbose {
@@ -1521,11 +1625,11 @@ impl TestRunner {
         let (mut scheduler, scheduler_handle) = Scheduler::new(
             sorted_files,
             effective_batch_size,
-            self.args.jobs,
+            effective_workers,
             predictions,
             has_timing_data,
             effective_batch_duration,
-            self.args.gpu_jobs,
+            effective_gpu_jobs,
             self.args.gpu_stagger,
         );
 
@@ -1542,7 +1646,7 @@ impl TestRunner {
 
         // Create worker states for per-worker progress display (TTY mode only)
         let worker_states = if !self.machine_output {
-            Some(Arc::new(WorkerStates::new(self.args.jobs)))
+            Some(Arc::new(WorkerStates::new(effective_workers)))
         } else {
             None
         };
@@ -1571,7 +1675,7 @@ impl TestRunner {
         let progress_shutdown_clone = progress_shutdown.clone();
         let total_files = test_files.len();
         let machine_output = self.machine_output;
-        let num_workers = self.args.jobs;
+        let num_workers = effective_workers;
         let progress_worker_states = worker_states.clone();
         let verbose_for_progress = self.args.verbose;
         let progress_fudge_factor = fudge_factor;
@@ -1609,10 +1713,10 @@ impl TestRunner {
         // Check if scheduler has work before spawning workers
         let initial_status = scheduler_handle_for_check.get_status();
         if !initial_status.is_empty {
-            for i in 0..self.args.jobs {
+            for i in 0..effective_workers {
                 debug_log!("spawning worker {}", i);
                 let slang_test = self.args.slang_test.as_ref().unwrap().clone();
-                let root_dir = self.args.root_dir.clone();
+                let root_dir = self.args.root_dir_effective.clone();
                 // Add -skip-api-detection if we've done the early API check successfully
                 let mut extra_args = self.args.extra_args.clone();
                 if skip_api_detection {
@@ -1758,7 +1862,7 @@ impl TestRunner {
             return;
         }
 
-        match self.args.diff.as_str() {
+        match resolve_diff_tool(self.args.diff.as_str()) {
             "none" => {
                 if self.machine_output {
                     println!("Expected:");
@@ -1789,7 +1893,11 @@ impl TestRunner {
                 self.run_external_diff("difft", &["--color", "always"], expected, actual);
             }
             _ => {
-                self.run_external_diff("diff", &["-y", "--color=always", "-W", "160"], expected, actual);
+                if let Some(w) = TERM_WIDTH.as_ref().filter(|_| !self.machine_output) {
+                    self.run_external_diff("diff", &["-y", "--color=always", "-t", "-W", w], expected, actual);
+                } else {
+                    self.run_external_diff("diff", &["-y", "--color=always", "-t"], expected, actual);
+                }
             }
         }
     }
@@ -1834,24 +1942,13 @@ impl TestRunner {
                 }
                 Err(_) => {
                     result.push_str(&format!("{}({} not available, showing raw output)\n", indent, cmd));
-                    if machine_output {
-                        result.push_str("Expected:\n");
-                        for line in expected.lines() {
-                            result.push_str(&format!("{}\n", line));
-                        }
-                        result.push_str("Actual:\n");
-                        for line in actual.lines() {
-                            result.push_str(&format!("{}\n", line));
-                        }
-                    } else {
-                        result.push_str(&format!("{}Expected:\n", indent));
-                        for line in expected.lines() {
-                            result.push_str(&format!("    {}\n", line));
-                        }
-                        result.push_str(&format!("{}Actual:\n", indent));
-                        for line in actual.lines() {
-                            result.push_str(&format!("    {}\n", line));
-                        }
+                    result.push_str(&format!("{}Expected:\n", indent));
+                    for line in expected.lines() {
+                        result.push_str(&format!("{}  {}\n", indent, line));
+                    }
+                    result.push_str(&format!("{}Actual:\n", indent));
+                    for line in actual.lines() {
+                        result.push_str(&format!("{}  {}\n", indent, line));
                     }
                 }
             }
@@ -1880,7 +1977,7 @@ impl TestRunner {
             sorted_failures.sort_by(|a, b| a.test_name.cmp(&b.test_name));
 
             // Pre-compute diffs in parallel for failures that have expected/actual
-            let diff_tool = self.args.diff.as_str();
+            let diff_tool = resolve_diff_tool(self.args.diff.as_str());
             let machine_output = self.machine_output;
             let diff_results: Vec<Option<String>> = if diff_tool != "none" {
                 let handles: Vec<_> = sorted_failures
@@ -1891,12 +1988,14 @@ impl TestRunner {
                             let actual = actual.clone();
                             let tool = diff_tool.to_string();
                             Some(thread::spawn(move || {
-                                let (cmd, args): (&str, &[&str]) = if tool == "difft" {
-                                    ("difft", &["--color", "always"])
+                                let (cmd, args): (&str, Vec<&str>) = if tool == "difft" {
+                                    ("difft", vec!["--color", "always"])
+                                } else if let Some(w) = TERM_WIDTH.as_ref().filter(|_| !machine_output) {
+                                    ("diff", vec!["-y", "--color=always", "-t", "-W", w])
                                 } else {
-                                    ("diff", &["-y", "--color=always", "-W", "160"])
+                                    ("diff", vec!["-y", "--color=always", "-t"])
                                 };
-                                Self::compute_external_diff(cmd, args, &expected, &actual, machine_output)
+                                Self::compute_external_diff(cmd, &args, &expected, &actual, machine_output)
                             }))
                         } else {
                             None
@@ -1914,7 +2013,7 @@ impl TestRunner {
 
             // Print results sequentially
             for (failure, diff_output) in sorted_failures.iter().zip(diff_results.iter()) {
-                println!("\n{}", failure.test_name.red());
+                println!("\n{}", failure.test_name.red().bold().underline());
 
                 if let (Some(expected), Some(actual)) = (&failure.expected, &failure.actual) {
                     if let Some(diff) = diff_output {
@@ -2033,32 +2132,53 @@ impl TestRunner {
         }
 
         if !failures.is_empty() {
-            let mut test_files: Vec<String> = failures
-                .iter()
-                .filter_map(|f| extract_base_test_file(&f.test_name))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            test_files.sort();
+            let failed_tests: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+            let test_args = minimize_test_filters(&failed_tests);
 
             println!("\n{}", "To rerun failed tests:".yellow());
 
-            let has_file_tests = test_files.iter().any(|f| f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl") || f.ends_with(".c"));
+            let has_file_tests = test_args.iter().any(|f| {
+                f.ends_with(".slang") || f.ends_with(".hlsl") || f.ends_with(".glsl") || f.ends_with(".c")
+                    || f.contains(".slang.") || f.contains(".hlsl.") || f.contains(".glsl.") || f.contains(".c.")
+            });
 
             let exe = std::env::args().next().unwrap_or_else(|| "sti".to_string());
             if has_file_tests {
                 print!("{}", exe);
-                if self.args.root_dir != PathBuf::from(".") {
-                    print!(" -C {}", self.args.root_dir.display());
+
+                // Only include options that were explicitly specified
+                if let Some(ref root_dir) = self.args.root_dir_original {
+                    print!(" -C {}", root_dir);
                 }
-                for file in &test_files {
-                    print!(" {}", file);
+                if let Some(ref build_type) = self.args.build_type {
+                    print!(" --build-type {}", build_type);
                 }
+                if let Some(ref slang_test) = self.args.slang_test_original {
+                    print!(" --slang-test {}", slang_test);
+                }
+
+                for arg in &test_args {
+                    if arg.contains('|') || arg.contains('(') || arg.contains(')') {
+                        print!(" '{}'", arg);
+                    } else {
+                        print!(" {}", arg);
+                    }
+                }
+
+                // Include extra args if any
+                if !self.args.extra_args.is_empty() {
+                    print!(" --");
+                    for arg in &self.args.extra_args {
+                        print!(" {}", arg);
+                    }
+                }
+
                 println!();
             } else {
+                // Internal tests - use slang-test directly
                 print!("{}", self.args.slang_test.as_ref().unwrap().display());
-                for file in &test_files {
-                    print!(" \"{}\"", file);
+                for arg in &test_args {
+                    print!(" \"{}\"", arg);
                 }
                 println!();
             }
