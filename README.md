@@ -1,5 +1,7 @@
 # Slang Test Interceptor
 
+> Better get tested!
+
 A wrapper for slang-test which implements several enhancements.
 
 > All stats and findings are from my machine, 7950X3D, 96GB, RTX 4090, Linux.
@@ -29,9 +31,24 @@ This is mainly due to better scheduling and more aggressive management of worker
 | ------------------------------------------------- | ----------------------------------- |
 | ![slang-test cpu stats in btop](./slang-test.png) | ![sti cpu stats in btop](./sti.png) |
 
-- More user friendly output
-- Graceful handling of segfaults or unexpected crashes
-- Estimated time to completion
+# More User friendly output
+
+At the end of the run:
+
+![A run of sti with some failures](./failed-run.png)
+
+- A predicted ETA calculated at the beginning
+- Failures with the same actual/expected diff are grouped
+- Diffs are shown using an external diff tool
+- A command to copy to run just the failed tests
+
+While the tests are running :
+
+![sti running](./during-run.png)
+
+- `[in-flight/pending/total-tests]`
+- finished tests stats
+- Timing information
 
 ## Usage
 

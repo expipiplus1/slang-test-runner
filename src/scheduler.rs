@@ -549,26 +549,11 @@ impl Scheduler {
         let mut in_flight_remaining = 0.0f64;
         let mut longest_remaining = 0.0f64;
 
-        // Check in-flight batches
         for batch in self.in_flight.values() {
             let elapsed = batch.start_time.elapsed().as_secs_f64();
             let remaining = (batch.predicted_duration - elapsed).max(0.0);
             in_flight_remaining += remaining;
             longest_remaining = longest_remaining.max(remaining);
-        }
-
-        // Check batches still in pool - find the longest one
-        for batch in &self.batches {
-            let batch_duration: f64 = batch.tests.iter()
-                .map(|f| self.predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION))
-                .sum();
-            longest_remaining = longest_remaining.max(batch_duration);
-        }
-
-        // Check pending files (not yet batched) - find the longest individual test
-        for file in &self.pending_files {
-            let duration = self.predictions.get(file).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-            longest_remaining = longest_remaining.max(duration);
         }
 
         let total_remaining = self.pool_predicted + in_flight_remaining;
