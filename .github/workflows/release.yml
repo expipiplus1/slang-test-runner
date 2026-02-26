@@ -68,7 +68,7 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           cd staging
-          zip ../sti-${{ matrix.target }}.zip ${{ matrix.artifact }}
+          7z a ../sti-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
