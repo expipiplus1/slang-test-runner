@@ -10,6 +10,16 @@ use crate::types::TestStats;
 /// Sentinel value meaning "no test running" (worker is idle or between batches)
 pub const WORKER_IDLE: usize = usize::MAX;
 
+/// Progress update interval in milliseconds (used by spawn_progress_thread)
+pub const PROGRESS_UPDATE_INTERVAL_MS: u64 = 16;
+
+/// Target interval for CPU/GPU queries in milliseconds
+const SYS_QUERY_INTERVAL_MS: u64 = 500;
+
+/// How many progress updates between CPU/GPU queries
+/// Calculated as SYS_QUERY_INTERVAL_MS / PROGRESS_UPDATE_INTERVAL_MS
+const SYS_QUERY_THRESHOLD: u32 = (SYS_QUERY_INTERVAL_MS / PROGRESS_UPDATE_INTERVAL_MS) as u32;
+
 /// State for a single worker, used to track what test is currently running.
 /// The worker writes to this, and the progress thread reads from it.
 pub struct WorkerState {
@@ -86,9 +96,6 @@ pub struct ProgressDisplay {
     last_report_time_ms: AtomicUsize,
     /// For machine output: tracks if we've reported 0% and 99%
     reported_milestones: AtomicUsize, // bit 0 = 0%, bit 1 = 99%
-    /// MultiProgress container - must be kept alive for progress bars to render correctly
-    #[allow(dead_code)]
-    multi_progress: Option<MultiProgress>,
     main_progress_bar: Option<ProgressBar>,
     worker_bars: Vec<Option<ProgressBar>>,
     verbose: bool,
@@ -106,8 +113,8 @@ pub struct ProgressDisplay {
 
 impl ProgressDisplay {
     pub fn new(total_files: usize, machine_output: bool, num_workers: usize, verbose: bool, eta_fudge_factor: f64) -> Self {
-        let (multi_progress, main_progress_bar, worker_bars) = if machine_output {
-            (None, None, Vec::new())
+        let (main_progress_bar, worker_bars) = if machine_output {
+            (None, Vec::new())
         } else {
             let mp = MultiProgress::new();
 
@@ -138,7 +145,9 @@ impl ProgressDisplay {
                     .unwrap(),
             );
 
-            (Some(mp), Some(main_pb), worker_bars)
+            // Note: mp is dropped here but the progress bars remain functional
+            // because mp.add() returns handles that are independent of MultiProgress lifetime
+            (Some(main_pb), worker_bars)
         };
 
         Self {
@@ -147,7 +156,6 @@ impl ProgressDisplay {
             machine_output,
             last_report_time_ms: AtomicUsize::new(0),
             reported_milestones: AtomicUsize::new(0),
-            multi_progress,
             main_progress_bar,
             worker_bars,
             verbose,
@@ -160,10 +168,10 @@ impl ProgressDisplay {
     }
 
     pub fn update(&mut self, stats: &TestStats, _files_completed: usize, batches_running: usize, _batches_remaining: usize, has_pending_batches: bool, eta_seconds: Option<f64>, worker_states: Option<&WorkerStates>) {
-        // Update CPU/GPU load every ~30 updates (~500ms at 16ms refresh rate), only in verbose mode
+        // Update CPU/GPU load periodically, only in verbose mode
         if self.verbose {
             self.sys_query_counter += 1;
-            if self.sys_query_counter >= 30 {
+            if self.sys_query_counter >= SYS_QUERY_THRESHOLD {
                 self.sys_query_counter = 0;
                 self.last_cpu_load = get_cpu_usage(&mut self.sys);
                 self.last_gpu_load = get_gpu_usage();

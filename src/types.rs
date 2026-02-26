@@ -371,7 +371,6 @@ pub struct BatchContext<'a> {
     pub retried_tests: &'a Mutex<HashMap<String, usize>>,
     pub scheduler: &'a SchedulerHandle,
     pub running: &'a AtomicUsize,
-    pub machine_output: bool,
     pub verbose: bool,
 }
 

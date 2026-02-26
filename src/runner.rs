@@ -1,7 +1,5 @@
 use anyhow::Result;
 use colored::Colorize;
-use rand::seq::SliceRandom;
-use rand::Rng;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -17,7 +15,7 @@ use crate::api::UnsupportedApis;
 use crate::debug_log;
 use crate::discovery::DiscoveryResult;
 use crate::event_log::log_event;
-use crate::progress::{ProgressDisplay, WorkerState, WorkerStates, SystemStats};
+use crate::progress::{ProgressDisplay, WorkerState, WorkerStates, SystemStats, PROGRESS_UPDATE_INTERVAL_MS};
 use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::timing::{BuildType, TimingCache};
 use crate::types::{
@@ -106,7 +104,6 @@ fn calculate_initial_eta(
 // ============================================================================
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-static COMPILING_CORE: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Process Reaper - cleans up finished processes without blocking
@@ -146,14 +143,6 @@ pub fn reap_process(child: std::process::Child) {
 /// Send a child process to the reaper for cleanup, with a label for logging
 pub fn reap_process_with_label(child: std::process::Child, label: String) {
     let _ = REAPER_TX.send(ReaperItem { child, label: Some(label) });
-}
-
-pub fn is_compiling_core() -> bool {
-    COMPILING_CORE.load(Ordering::SeqCst)
-}
-
-pub fn set_compiling_core(compiling: bool) {
-    COMPILING_CORE.store(compiling, Ordering::SeqCst);
 }
 
 pub fn is_interrupted() -> bool {
@@ -620,6 +609,293 @@ fn handle_incomplete_batch(
 }
 
 // ============================================================================
+// Batch Execution - Output Reader
+// ============================================================================
+
+/// Channels for receiving data from the output reader thread
+struct OutputReaderChannels {
+    outcome_rx: crossbeam_channel::Receiver<TestOutcome>,
+    timing_rx: crossbeam_channel::Receiver<(String, f64)>,
+    done_rx: crossbeam_channel::Receiver<bool>,
+    compiling_rx: crossbeam_channel::Receiver<bool>,
+}
+
+/// Result of spawning the output reader
+struct OutputReaderHandle {
+    channels: OutputReaderChannels,
+    thread_handle: thread::JoinHandle<()>,
+}
+
+/// Spawn the output reader thread that parses slang-test output
+fn spawn_output_reader(pipe_reader: os_pipe::PipeReader) -> OutputReaderHandle {
+    let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
+    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>();
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1);
+    let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
+
+    let thread_handle = thread::Builder::new()
+        .name("output-reader".to_string())
+        .spawn(move || {
+            let reader = BufReader::new(pipe_reader);
+
+            let mut last_test_time: Option<Instant> = None;
+            let mut pending_output: Vec<String> = Vec::new();
+            let mut past_initial_spew = false;
+            let mut lines_read = 0;
+
+            for line in reader.lines() {
+                lines_read += 1;
+                if is_interrupted() {
+                    break;
+                }
+                if let Ok(line) = line {
+                    // Detect the summary line that indicates normal completion
+                    if line.starts_with("===") || line.contains("% of tests") || line == "no tests run" {
+                        let _ = done_tx.try_send(true);
+                        continue;
+                    }
+
+                    // Handle "Compiling" messages - notify progress display
+                    if line.contains("Compiling") {
+                        let _ = compiling_tx.send(true);
+                        continue;
+                    }
+
+                    // Skip slang-test initial output
+                    if line.starts_with("Supported backends:")
+                        || line.starts_with("Check ")
+                        || line.starts_with("Retrying ")
+                    {
+                        last_test_time = Some(Instant::now());
+                        continue;
+                    }
+
+                    // Detect end of initial spew
+                    if !past_initial_spew {
+                        if line.starts_with('[') || line.contains("EXPECTED{{{") || line.contains("ACTUAL{{{") {
+                            past_initial_spew = true;
+                        }
+                    }
+
+                    // Try to parse as test result line
+                    if let Some(mut outcome) = parse_test_output(&line) {
+                        let now = Instant::now();
+
+                        let test_duration = if last_test_time.is_some() {
+                            outcome.duration
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or_else(|| last_test_time.unwrap().elapsed().as_secs_f64())
+                        } else {
+                            0.0
+                        };
+
+                        if outcome.duration.is_none() && last_test_time.is_some() {
+                            outcome.duration = Some(Duration::from_secs_f64(test_duration));
+                        }
+
+                        last_test_time = Some(now);
+
+                        if outcome.result == TestResult::Failed {
+                            outcome.failure_output = std::mem::take(&mut pending_output);
+                        } else {
+                            pending_output.clear();
+                        }
+
+                        past_initial_spew = true;
+
+                        let test_id = TestId::parse(&outcome.name);
+                        let timing_key = test_id.to_timing_key();
+
+                        if test_duration > 0.0 {
+                            let _ = timing_tx.send((timing_key.clone(), test_duration));
+                        }
+
+                        let _ = outcome_tx.send(outcome);
+                    } else if past_initial_spew {
+                        pending_output.push(line);
+                    }
+                }
+            }
+            let _ = compiling_tx.send(false);
+            debug_log!("output reader exiting after {} lines", lines_read);
+        })
+        .expect("failed to spawn output reader thread");
+
+    OutputReaderHandle {
+        channels: OutputReaderChannels {
+            outcome_rx,
+            timing_rx,
+            done_rx,
+            compiling_rx,
+        },
+        thread_handle,
+    }
+}
+
+// ============================================================================
+// Batch Execution - Monitoring
+// ============================================================================
+
+/// Result of monitoring a batch execution
+struct BatchMonitorResult {
+    need_kill: bool,
+    killed_for_timeout: bool,
+    exit_status: Option<std::process::ExitStatus>,
+    seen_tests: HashSet<String>,
+}
+
+/// Monitor the batch execution, processing outcomes as they arrive
+fn monitor_batch_execution(
+    child: &mut std::process::Child,
+    channels: &OutputReaderChannels,
+    ctx: &BatchContext,
+    expected_test_count: usize,
+    batch_id: std::thread::ThreadId,
+    test_time_sum: &std::sync::atomic::AtomicU64,
+    test_count: &AtomicUsize,
+    failed_outcomes: &mut Vec<TestOutcome>,
+    worker_state: Option<&WorkerState>,
+) -> BatchMonitorResult {
+    let start = Instant::now();
+    let mut killed_for_timeout = false;
+    let mut exit_status: Option<std::process::ExitStatus> = None;
+    let mut seen_tests: HashSet<String> = HashSet::new();
+    let mut need_kill = false;
+
+    debug_log!("entering batch monitor loop, expecting {} tests", expected_test_count);
+
+    loop {
+        if is_interrupted() {
+            debug_log!("batch monitor: interrupted");
+            need_kill = true;
+            break;
+        }
+
+        // Check compilation status
+        while let Ok(is_compiling) = channels.compiling_rx.try_recv() {
+            ctx.stats.set_compiling(is_compiling);
+        }
+
+        // Process timing updates
+        while let Ok((test_id, duration)) = channels.timing_rx.try_recv() {
+            ctx.stats.record_observed_timing(&test_id, duration);
+        }
+
+        // Process test outcomes
+        while let Ok(outcome) = channels.outcome_rx.try_recv() {
+            ctx.stats.set_compiling(false);
+            ctx.stats.record_test_output();
+            let result_str = match outcome.result {
+                TestResult::Passed => "passed",
+                TestResult::Failed => "failed",
+                TestResult::Ignored => "ignored",
+            };
+            let duration_ms = outcome.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
+            test_time_sum.fetch_add(duration_ms, Ordering::SeqCst);
+            test_count.fetch_add(1, Ordering::SeqCst);
+            log_event("test", &format!("{:?} {} {} duration_ms={}", batch_id, result_str, outcome.name, duration_ms));
+
+            let test_id = TestId::parse(&outcome.name);
+            seen_tests.insert(test_id.to_timing_key());
+
+            process_outcome(outcome, ctx, failed_outcomes);
+
+            if let Some(state) = worker_state {
+                state.advance();
+            }
+        }
+
+        // Check completion conditions
+        if seen_tests.len() >= expected_test_count {
+            debug_log!("batch monitor: all {} tests seen", expected_test_count);
+            break;
+        }
+
+        if channels.done_rx.try_recv().is_ok() {
+            debug_log!("batch monitor: done signal received");
+            break;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                debug_log!("batch monitor: child exited with {:?}, seen {}/{} tests",
+                    status, seen_tests.len(), expected_test_count);
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > ctx.timeout {
+                    debug_log!("batch monitor: timeout after {}s", ctx.timeout.as_secs());
+                    need_kill = true;
+                    killed_for_timeout = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                debug_log!("batch monitor: try_wait error: {}", e);
+                break;
+            }
+        }
+    }
+
+    debug_log!("batch monitor loop exited: need_kill={} seen={}/{}", need_kill, seen_tests.len(), expected_test_count);
+
+    BatchMonitorResult {
+        need_kill,
+        killed_for_timeout,
+        exit_status,
+        seen_tests,
+    }
+}
+
+/// Drain any remaining outcomes after the output reader thread joins
+fn drain_remaining_outcomes(
+    channels: &OutputReaderChannels,
+    ctx: &BatchContext,
+    seen_tests: &mut HashSet<String>,
+    failed_outcomes: &mut Vec<TestOutcome>,
+) {
+    debug_log!("drain: draining remaining outcomes");
+    let mut drained_count = 0;
+    while let Ok(outcome) = channels.outcome_rx.try_recv() {
+        debug_log!("drain: got outcome {}", outcome.name);
+        drained_count += 1;
+
+        let test_id = TestId::parse(&outcome.name);
+        seen_tests.insert(test_id.to_timing_key());
+
+        process_outcome(outcome, ctx, failed_outcomes);
+    }
+    debug_log!("drain: drained {} outcomes", drained_count);
+
+    while let Ok((test_id, duration)) = channels.timing_rx.try_recv() {
+        ctx.stats.record_observed_timing(&test_id, duration);
+    }
+}
+
+/// Print a warning for slow batches (verbose mode only)
+fn warn_slow_batch(ctx: &BatchContext, loop_time: Duration, total_pred: f64) {
+    if ctx.verbose && loop_time.as_secs() > 30 {
+        let extra_args_str = if ctx.extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", ctx.extra_args.join(" "))
+        };
+        let repro_args: Vec<String> = ctx.test_files
+            .iter()
+            .map(|f| TestId::parse(f).to_slang_test_arg())
+            .collect();
+        eprintln!("{}", format!("\nWARNING: Batch took {:.1}s (predicted {:.1}s)", loop_time.as_secs_f64(), total_pred).dimmed());
+        eprintln!("{}", format!("  Reproduce: time {} {}{}",
+            ctx.slang_test.display(),
+            repro_args.join(" "),
+            extra_args_str
+        ).dimmed());
+    }
+}
+
+// ============================================================================
 // Batch Execution - Main Function
 // ============================================================================
 
@@ -635,7 +911,6 @@ pub fn run_batch_with_pool(
     retried_tests: &Mutex<HashMap<String, usize>>,
     scheduler: &SchedulerHandle,
     running: &AtomicUsize,
-    machine_output: bool,
     verbose: bool,
     worker_state: Option<&WorkerState>,
 ) {
@@ -651,7 +926,6 @@ pub fn run_batch_with_pool(
         retried_tests,
         scheduler,
         running,
-        machine_output,
         verbose,
     };
 
@@ -721,279 +995,48 @@ pub fn run_batch_with_pool(
         }
     };
 
-    let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<TestOutcome>();
-    let (timing_tx, timing_rx) = crossbeam_channel::unbounded::<(String, f64)>();
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1);
-    let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<bool>();
+    // Spawn output reader thread
+    let output_reader = spawn_output_reader(pipe_reader);
 
-    let machine_output_for_stderr = ctx.machine_output;
-
-    // Single reader thread for combined stdout/stderr
-    let output_handle = thread::Builder::new()
-        .name("output-reader".to_string())
-        .spawn(move || {
-        let reader = BufReader::new(pipe_reader);
-
-        let mut last_test_time: Option<Instant> = None;
-        let mut pending_output: Vec<String> = Vec::new();
-        let mut past_initial_spew = false;
-        let mut lines_read = 0;
-
-        for line in reader.lines() {
-            lines_read += 1;
-            if is_interrupted() {
-                break;
-            }
-            if let Ok(line) = line {
-                // Detect the summary line that indicates normal completion
-                if line.starts_with("===") || line.contains("% of tests") || line == "no tests run" {
-                    let _ = done_tx.try_send(true);
-                    continue;
-                }
-
-                // Handle "Compiling" messages
-                if line.contains("Compiling core module") {
-                    set_compiling_core(true);
-                    let _ = compiling_tx.send(true);
-                    if machine_output_for_stderr {
-                        eprintln!("{}", format!("INFO: {}", line).dimmed());
-                    }
-                    continue;
-                } else if line.contains("Compiling") {
-                    let _ = compiling_tx.send(true);
-                    continue;
-                }
-
-                // Skip slang-test initial output
-                if line.starts_with("Supported backends:")
-                    || line.starts_with("Check ")
-                    || line.starts_with("Retrying ")
-                {
-                    last_test_time = Some(Instant::now());
-                    continue;
-                }
-
-                // Detect end of initial spew
-                if !past_initial_spew {
-                    if line.starts_with('[') || line.contains("EXPECTED{{{") || line.contains("ACTUAL{{{") {
-                        past_initial_spew = true;
-                    }
-                }
-
-                // Try to parse as test result line
-                if let Some(mut outcome) = parse_test_output(&line) {
-                    let now = Instant::now();
-
-                    let test_duration = if last_test_time.is_some() {
-                        outcome.duration
-                            .map(|d| d.as_secs_f64())
-                            .unwrap_or_else(|| last_test_time.unwrap().elapsed().as_secs_f64())
-                    } else {
-                        0.0
-                    };
-
-                    if outcome.duration.is_none() && last_test_time.is_some() {
-                        outcome.duration = Some(Duration::from_secs_f64(test_duration));
-                    }
-
-                    last_test_time = Some(now);
-
-                    if outcome.result == TestResult::Failed {
-                        outcome.failure_output = std::mem::take(&mut pending_output);
-                    } else {
-                        pending_output.clear();
-                    }
-
-                    past_initial_spew = true;
-
-                    let test_id = TestId::parse(&outcome.name);
-                    let timing_key = test_id.to_timing_key();
-
-                    if test_duration > 0.0 {
-                        let _ = timing_tx.send((timing_key.clone(), test_duration));
-                    }
-
-                    let _ = outcome_tx.send(outcome);
-                } else if past_initial_spew {
-                    pending_output.push(line);
-                }
-            }
-        }
-        let _ = compiling_tx.send(false);
-        debug_log!("output reader exiting after {} lines", lines_read);
-    }).expect("failed to spawn output reader thread");
-
+    // Monitor batch execution
     let mut failed_outcomes: Vec<TestOutcome> = Vec::new();
-    let start = Instant::now();
-    let mut this_batch_is_compiling = false;
-    let mut killed_for_compilation = false;
-    let mut killed_for_timeout = false;
-    let mut exit_status: Option<std::process::ExitStatus> = None;
-    let mut seen_tests: HashSet<String> = HashSet::new();
     let expected_test_count = ctx.test_files.len();
+    let monitor_start = Instant::now();
 
-    let mut need_kill = false;
-    debug_log!("entering batch monitor loop, expecting {} tests", expected_test_count);
-
-    // Main monitoring loop
-    loop {
-        if is_interrupted() {
-            debug_log!("batch monitor: interrupted");
-            need_kill = true;
-            break;
-        }
-
-        // Check compilation status
-        while let Ok(is_compiling) = compiling_rx.try_recv() {
-            ctx.stats.set_compiling(is_compiling);
-            if is_compiling {
-                this_batch_is_compiling = true;
-            }
-        }
-
-        if is_compiling_core() && !this_batch_is_compiling {
-            debug_log!("batch monitor: killing for compilation");
-            need_kill = true;
-            killed_for_compilation = true;
-            break;
-        }
-
-        // Process timing updates
-        while let Ok((test_id, duration)) = timing_rx.try_recv() {
-            ctx.stats.record_observed_timing(&test_id, duration);
-        }
-
-        // Process test outcomes
-        while let Ok(outcome) = outcome_rx.try_recv() {
-            ctx.stats.set_compiling(false);
-            ctx.stats.record_test_output();
-            if this_batch_is_compiling {
-                set_compiling_core(false);
-                this_batch_is_compiling = false;
-            }
-            let result_str = match outcome.result {
-                TestResult::Passed => "passed",
-                TestResult::Failed => "failed",
-                TestResult::Ignored => "ignored",
-            };
-            let duration_ms = outcome.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
-            test_time_sum.fetch_add(duration_ms, Ordering::SeqCst);
-            test_count.fetch_add(1, Ordering::SeqCst);
-            log_event("test", &format!("{:?} {} {} duration_ms={}", batch_id, result_str, outcome.name, duration_ms));
-
-            let test_id = TestId::parse(&outcome.name);
-            seen_tests.insert(test_id.to_timing_key());
-
-            process_outcome(outcome, &ctx, &mut failed_outcomes);
-
-            if let Some(state) = worker_state {
-                state.advance();
-            }
-        }
-
-        // Check completion conditions
-        if seen_tests.len() >= expected_test_count {
-            debug_log!("batch monitor: all {} tests seen", expected_test_count);
-            break;
-        }
-
-        if done_rx.try_recv().is_ok() {
-            debug_log!("batch monitor: done signal received");
-            break;
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                debug_log!("batch monitor: child exited with {:?}, seen {}/{} tests",
-                    status, seen_tests.len(), expected_test_count);
-                exit_status = Some(status);
-                break;
-            }
-            Ok(None) => {
-                if start.elapsed() > ctx.timeout {
-                    debug_log!("batch monitor: timeout after {}s", ctx.timeout.as_secs());
-                    need_kill = true;
-                    killed_for_timeout = true;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => {
-                debug_log!("batch monitor: try_wait error: {}", e);
-                break;
-            }
-        }
-    }
-    debug_log!("batch monitor loop exited: need_kill={} seen={}/{}", need_kill, seen_tests.len(), expected_test_count);
+    let mut monitor_result = monitor_batch_execution(
+        &mut child,
+        &output_reader.channels,
+        &ctx,
+        expected_test_count,
+        batch_id,
+        &test_time_sum,
+        &test_count,
+        &mut failed_outcomes,
+        worker_state,
+    );
 
     // Clean up the child process
-    if need_kill {
+    if monitor_result.need_kill {
         debug_log!("killing child process");
         let _ = child.kill();
     }
     debug_log!("sending child to reaper");
     reap_process(child);
 
-    let loop_time = start.elapsed();
-    if ctx.verbose && loop_time.as_secs() > 30 {
-        let extra_args_str = if ctx.extra_args.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", ctx.extra_args.join(" "))
-        };
-        let repro_args: Vec<String> = ctx.test_files
-            .iter()
-            .map(|f| TestId::parse(f).to_slang_test_arg())
-            .collect();
-        eprintln!("{}", format!("\nWARNING: Batch took {:.1}s (predicted {:.1}s)", loop_time.as_secs_f64(), total_pred).dimmed());
-        eprintln!("{}", format!("  Reproduce: time {} {}{}",
-            ctx.slang_test.display(),
-            repro_args.join(" "),
-            extra_args_str
-        ).dimmed());
-    }
+    let loop_time = monitor_start.elapsed();
+    warn_slow_batch(&ctx, loop_time, total_pred);
 
-    // Handle compilation-killed batch
-    if killed_for_compilation {
-        debug_log!("killed for compilation, repooling {} tests", ctx.test_files.len());
-        if let Some(state) = worker_state {
-            state.clear();
-        }
-        ctx.scheduler.add_tests(ctx.test_files.iter().map(|s| s.to_string()).collect());
-        debug_log!("waiting for core compilation to complete");
-        while is_compiling_core() && !is_interrupted() {
-            thread::sleep(Duration::from_millis(50));
-        }
-        debug_log!("core compilation wait finished");
-        return;
-    }
-
-    // Drain remaining outcomes
+    // Drain remaining outcomes after joining output thread
     debug_log!("drain: joining output thread");
-    let join_result = output_handle.join();
+    let join_result = output_reader.thread_handle.join();
     debug_log!("drain: output thread joined with result {:?}", join_result.is_ok());
 
-    debug_log!("drain: draining remaining outcomes");
-    let mut drained_count = 0;
-    while let Ok(outcome) = outcome_rx.try_recv() {
-        debug_log!("drain: got outcome {}", outcome.name);
-        drained_count += 1;
-
-        let test_id = TestId::parse(&outcome.name);
-        seen_tests.insert(test_id.to_timing_key());
-
-        process_outcome(outcome, &ctx, &mut failed_outcomes);
-    }
-    debug_log!("drain: drained {} outcomes", drained_count);
-
-    while let Ok((test_id, duration)) = timing_rx.try_recv() {
-        ctx.stats.record_observed_timing(&test_id, duration);
-    }
+    drain_remaining_outcomes(&output_reader.channels, &ctx, &mut monitor_result.seen_tests, &mut failed_outcomes);
 
     // Handle incomplete batches (crash/timeout)
-    let all_tests_seen = seen_tests.len() >= expected_test_count;
-    if !all_tests_seen && !is_interrupted() && !killed_for_compilation {
-        handle_incomplete_batch(&ctx, &seen_tests, exit_status, killed_for_timeout, loop_time);
+    let all_tests_seen = monitor_result.seen_tests.len() >= expected_test_count;
+    if !all_tests_seen && !is_interrupted() {
+        handle_incomplete_batch(&ctx, &monitor_result.seen_tests, monitor_result.exit_status, monitor_result.killed_for_timeout, loop_time);
     }
 
     // Store failure info
@@ -1006,6 +1049,323 @@ pub fn run_batch_with_pool(
     if let Some(state) = worker_state {
         state.clear();
     }
+}
+
+// ============================================================================
+// Test Runner - Helper Types
+// ============================================================================
+
+/// Effective parameters calculated for a test run
+struct EffectiveParams {
+    workers: usize,
+    gpu_jobs: Option<usize>,
+    batch_size: usize,
+    batch_duration: f64,
+    has_timing_data: bool,
+    fudge_factor: f64,
+}
+
+/// Calculate effective parameters for a test run
+fn calculate_effective_params(
+    args: &crate::Args,
+    timing_cache: &TimingCache,
+    build_type: Option<BuildType>,
+    test_files: &[String],
+    predictions: &HashMap<String, f64>,
+) -> EffectiveParams {
+    let num_tests = test_files.len();
+    let effective_workers = args.jobs.min(num_tests);
+
+    let effective_gpu_jobs = args.gpu_jobs.map(|g| {
+        let gpu_test_count = test_files.iter().filter(|t| TestId::parse(t).is_gpu_test()).count();
+        g.min(gpu_test_count.max(1))
+    });
+
+    let has_timing_data = !args.no_timing_cache && build_type.is_some() &&
+        build_type.map(|bt| timing_cache.has_timing_data(bt)).unwrap_or(false);
+
+    let predicted_runtime = if has_timing_data {
+        calculate_initial_eta(predictions, effective_workers, effective_gpu_jobs)
+    } else {
+        (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / effective_workers as f64
+    };
+
+    let effective_batch_size = if args.batch_size == 0 {
+        if effective_workers == 1 {
+            usize::MAX
+        } else if has_timing_data {
+            ((test_files.len() / effective_workers) * 2).max(1)
+        } else {
+            50.min(test_files.len() / effective_workers).max(1)
+        }
+    } else {
+        args.batch_size
+    };
+
+    let effective_batch_duration = if args.batch_duration == 0.0 {
+        if effective_workers == 1 {
+            f64::INFINITY
+        } else if has_timing_data {
+            (predicted_runtime / 2.0).max(1.0)
+        } else {
+            10.0
+        }
+    } else {
+        args.batch_duration
+    };
+
+    let fudge_factor = if has_timing_data {
+        build_type
+            .map(|bt| timing_cache.average_fudge_factor(bt, test_files))
+            .unwrap_or(1.0)
+    } else {
+        1.0
+    };
+
+    EffectiveParams {
+        workers: effective_workers,
+        gpu_jobs: effective_gpu_jobs,
+        batch_size: effective_batch_size,
+        batch_duration: effective_batch_duration,
+        has_timing_data,
+        fudge_factor,
+    }
+}
+
+/// Build predictions for test durations
+fn build_predictions(
+    timing_cache: &TimingCache,
+    build_type: Option<BuildType>,
+    test_files: &[String],
+) -> HashMap<String, f64> {
+    test_files.iter()
+        .map(|f| {
+            let timing_key = test_to_timing_key(f);
+            let pred = build_type
+                .map(|bt| timing_cache.predict(bt, &timing_key))
+                .unwrap_or(DEFAULT_PREDICTED_DURATION);
+            (f.clone(), pred)
+        })
+        .collect()
+}
+
+/// Constrained random shuffle of tests based on timing predictions
+fn shuffle_tests_by_timing(
+    test_files: &[String],
+    predictions: &HashMap<String, f64>,
+    has_timing_data: bool,
+) -> Vec<String> {
+    use rand::Rng;
+    use rand::seq::SliceRandom;
+
+    if has_timing_data {
+        let mut rng = rand::thread_rng();
+        let total_predicted: f64 = predictions.values().sum();
+        let n = test_files.len();
+
+        if total_predicted > 0.0 && n > 0 {
+            let mut files_with_pos: Vec<_> = test_files.iter()
+                .map(|f| {
+                    let dur = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
+                    let latest = ((total_predicted - dur) / total_predicted).max(0.5);
+                    let position = rng.gen_range(0.0..=latest);
+                    (f.clone(), position)
+                })
+                .collect();
+
+            files_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            files_with_pos.into_iter().map(|(f, _)| f).collect()
+        } else {
+            let mut files = test_files.to_vec();
+            files.shuffle(&mut rng);
+            files
+        }
+    } else {
+        let mut files = test_files.to_vec();
+        files.shuffle(&mut rand::thread_rng());
+        files
+    }
+}
+
+/// Print warnings about GPU and unknown APIs
+fn print_api_warnings(
+    unsupported_apis: Option<&UnsupportedApis>,
+    unknown_apis: &HashSet<String>,
+    has_unknown_apis: bool,
+) {
+    // Don't print warnings if interrupted
+    if is_interrupted() {
+        return;
+    }
+
+    if let Some(unsupported) = unsupported_apis {
+        if unsupported.gpu_disabled {
+            let apis = UnsupportedApis::disabled_gpu_apis();
+            eprintln!("{}", format!(
+                "GPU tests skipped (-g 0): {}, gfx-unit-test-tool",
+                apis.join(", ")
+            ).dimmed());
+        }
+    }
+
+    if has_unknown_apis {
+        let mut apis_list: Vec<_> = unknown_apis.iter().collect();
+        apis_list.sort();
+        let apis_str = apis_list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+        eprintln!("{}", format!(
+            "Warning: Found tests for unknown APIs ({}) - will not skip API detection in batch runs",
+            apis_str
+        ).dimmed());
+    }
+}
+
+/// Spawn the progress display thread
+fn spawn_progress_thread(
+    stats: Arc<TestStats>,
+    running: Arc<AtomicUsize>,
+    scheduler_handle: SchedulerHandle,
+    shutdown: Arc<AtomicBool>,
+    total_files: usize,
+    machine_output: bool,
+    num_workers: usize,
+    verbose: bool,
+    fudge_factor: f64,
+    worker_states: Option<Arc<WorkerStates>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose, fudge_factor);
+        let mut sys_stats: Option<SystemStats> = None;
+        let mut stats_counter = 0u32;
+        while !shutdown.load(Ordering::SeqCst) {
+            let files_done = stats.files_completed();
+            let batches_running = running.load(Ordering::SeqCst);
+
+            let status = scheduler_handle.get_status();
+            let eta = if scheduler_handle.has_timing_data {
+                Some(status.eta)
+            } else {
+                None
+            };
+            display.update(&stats, files_done, batches_running, status.remaining, status.has_pending_batches, eta, worker_states.as_deref());
+
+            stats_counter += 1;
+            if stats_counter >= 10 {
+                stats_counter = 0;
+                let sys = sys_stats.get_or_insert_with(SystemStats::new);
+                sys.refresh_and_log(batches_running, status.remaining);
+            }
+
+            thread::sleep(Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS));
+        }
+        display.finish(&stats);
+    })
+}
+
+/// Spawn a single worker thread
+fn spawn_worker_thread(
+    worker_id: usize,
+    slang_test: PathBuf,
+    root_dir: PathBuf,
+    extra_args: Vec<String>,
+    timeout: Duration,
+    stats: Arc<TestStats>,
+    failures: Arc<Mutex<Vec<FailureInfo>>>,
+    retries: usize,
+    retried_tests: Arc<Mutex<HashMap<String, usize>>>,
+    scheduler_handle: SchedulerHandle,
+    running: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
+    verbose: bool,
+    worker_states: Option<Arc<WorkerStates>>,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("worker-{}", worker_id))
+        .spawn(move || {
+            debug_log!("started, getting first batch");
+            let my_state = worker_states.as_ref().map(|ws| ws.get(worker_id));
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    debug_log!("shutdown flag set, exiting");
+                    break;
+                }
+                if is_interrupted() {
+                    debug_log!("interrupted, exiting");
+                    break;
+                }
+
+                let get_batch_start = Instant::now();
+                if let Some(assignment) = scheduler_handle.get_batch() {
+                    let get_batch_time = get_batch_start.elapsed();
+                    if get_batch_time.as_millis() > 10 {
+                        debug_log!("get_batch took {:.3}s", get_batch_time.as_secs_f64());
+                    }
+                    debug_log!("got batch {} of {} tests ({:?})", assignment.batch_id, assignment.tests.len(), assignment.kind);
+                    run_batch_with_pool(
+                        &slang_test,
+                        &root_dir,
+                        &assignment.tests,
+                        &extra_args,
+                        timeout,
+                        &stats,
+                        &failures,
+                        retries,
+                        &retried_tests,
+                        &scheduler_handle,
+                        &running,
+                        verbose,
+                        my_state,
+                    );
+                    debug_log!("batch {} completed, calling complete_batch", assignment.batch_id);
+                    scheduler_handle.complete_batch(assignment.batch_id);
+                    debug_log!("batch {} complete_batch done", assignment.batch_id);
+                } else {
+                    let status = scheduler_handle.get_status();
+                    debug_log!("no batch available: batches={} pending={} in_flight={:?}",
+                        status.debug_state.0, status.debug_state.1, status.debug_state.2);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            debug_log!("worker loop exited");
+        })
+        .expect("failed to spawn worker thread")
+}
+
+/// Run the main monitoring loop until all work is complete
+fn run_main_monitoring_loop(
+    scheduler_handle: &SchedulerHandle,
+    running: &AtomicUsize,
+    shutdown: &AtomicBool,
+) {
+    debug_log!("entering main loop");
+
+    loop {
+        let status = scheduler_handle.get_status();
+        let running_count = running.load(Ordering::SeqCst);
+
+        if status.is_empty && running_count == 0 {
+            debug_log!("main loop: scheduler empty and no batches running, exiting");
+            break;
+        }
+
+        if is_interrupted() {
+            debug_log!("main loop: interrupted, exiting");
+            break;
+        }
+
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_ms = DEBUG_START.elapsed().as_millis() as u64;
+        let last = LAST_LOG.load(Ordering::Relaxed);
+        if now_ms - last > 1000 {
+            LAST_LOG.store(now_ms, Ordering::Relaxed);
+            debug_log!("main loop: running={} batches={} pending={} in_flight={:?}",
+                running_count, status.debug_state.0, status.debug_state.1, status.debug_state.2);
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    debug_log!("main loop exited, setting shutdown flag");
+    shutdown.store(true, Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -1087,12 +1447,15 @@ impl TestRunner {
         let has_unknown_apis = !self.unknown_apis.is_empty();
 
         if test_files.is_empty() {
-            let msg = if api_ignored > 0 {
-                format!("No tests found matching the specified criteria (ignoring {} tests on unsupported APIs)", api_ignored)
-            } else {
-                "No tests found matching the specified criteria".to_string()
-            };
-            eprintln!("{}", msg);
+            // Only print "no tests found" if not interrupted (otherwise it's expected)
+            if !is_interrupted() {
+                let msg = if api_ignored > 0 {
+                    format!("No tests found matching the specified criteria (ignoring {} tests on unsupported APIs)", api_ignored)
+                } else {
+                    "No tests found matching the specified criteria".to_string()
+                };
+                eprintln!("{}", msg);
+            }
         } else {
             // Note: dry_run is handled in main.rs before creating TestRunner
             self.run_file_tests(test_files, has_unknown_apis)?;
@@ -1114,133 +1477,29 @@ impl TestRunner {
             return Ok(());
         }
 
-        let num_tests = test_files.len();
-        let effective_workers = self.args.jobs.min(num_tests);
-
-        let effective_gpu_jobs = self.args.gpu_jobs.map(|g| {
-            let gpu_test_count = test_files.iter().filter(|t| TestId::parse(t).is_gpu_test()).count();
-            g.min(gpu_test_count.max(1))
-        });
-
-        let has_timing_data = !self.args.no_timing_cache && self.build_type.is_some() && {
+        // Build predictions and calculate effective parameters
+        let predictions = {
             let cache = self.timing_cache.lock().unwrap();
-            self.build_type.map(|bt| cache.has_timing_data(bt)).unwrap_or(false)
+            build_predictions(&cache, self.build_type, test_files)
         };
 
-        let predictions: HashMap<String, f64> = {
+        let params = {
             let cache = self.timing_cache.lock().unwrap();
-            let build_type = self.build_type;
-            test_files.iter()
-                .map(|f| {
-                    let timing_key = test_to_timing_key(f);
-                    let pred = build_type
-                        .map(|bt| cache.predict(bt, &timing_key))
-                        .unwrap_or(DEFAULT_PREDICTED_DURATION);
-                    (f.clone(), pred)
-                })
-                .collect()
+            calculate_effective_params(&self.args, &cache, self.build_type, test_files, &predictions)
         };
 
-        let predicted_runtime = if has_timing_data {
-            calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs)
-        } else {
-            (test_files.len() as f64 * DEFAULT_PREDICTED_DURATION) / effective_workers as f64
-        };
+        // Shuffle tests for better parallelization
+        let sorted_files = shuffle_tests_by_timing(test_files, &predictions, params.has_timing_data);
 
-        let effective_batch_size = if self.args.batch_size == 0 {
-            if effective_workers == 1 {
-                usize::MAX
-            } else if has_timing_data {
-                ((test_files.len() / effective_workers) * 2).max(1)
-            } else {
-                50.min(test_files.len() / effective_workers).max(1)
-            }
-        } else {
-            self.args.batch_size
-        };
-
-        let effective_batch_duration = if self.args.batch_duration == 0.0 {
-            if effective_workers == 1 {
-                f64::INFINITY
-            } else if has_timing_data {
-                (predicted_runtime / 2.0).max(1.0)
-            } else {
-                10.0
-            }
-        } else {
-            self.args.batch_duration
-        };
-
-        // Constrained random shuffle
-        let sorted_files: Vec<String> = if has_timing_data {
-            let mut rng = rand::thread_rng();
-            let total_predicted: f64 = predictions.values().sum();
-            let n = test_files.len();
-
-            if total_predicted > 0.0 && n > 0 {
-                let mut files_with_pos: Vec<_> = test_files.iter()
-                    .map(|f| {
-                        let dur = predictions.get(f).copied().unwrap_or(DEFAULT_PREDICTED_DURATION);
-                        let latest = ((total_predicted - dur) / total_predicted).max(0.5);
-                        let position = rng.gen_range(0.0..=latest);
-                        (f.clone(), position)
-                    })
-                    .collect();
-
-                files_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                files_with_pos.into_iter().map(|(f, _)| f).collect()
-            } else {
-                let mut files = test_files.to_vec();
-                files.shuffle(&mut rng);
-                files
-            }
-        } else {
-            let mut files = test_files.to_vec();
-            files.shuffle(&mut rand::thread_rng());
-            files
-        };
-
-        // Print additional warnings (main "Running X tests" line is printed by discovery)
-        if let Some(ref unsupported) = self.unsupported_apis {
-            if unsupported.gpu_disabled {
-                let apis = UnsupportedApis::disabled_gpu_apis();
-                eprintln!("{}", format!(
-                    "GPU tests skipped (-g 0): {}, gfx-unit-test-tool",
-                    apis.join(", ")
-                ).dimmed());
-            }
-        }
-
-        if has_unknown_apis {
-            let mut apis_list: Vec<_> = self.unknown_apis.iter().collect();
-            apis_list.sort();
-            let apis_str = apis_list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-            eprintln!("{}", format!(
-                "Warning: Found tests for unknown APIs ({}) - will not skip API detection in batch runs",
-                apis_str
-            ).dimmed());
-        }
+        // Print warnings
+        print_api_warnings(self.unsupported_apis.as_ref(), &self.unknown_apis, has_unknown_apis);
 
         let skip_api_detection = self.skip_api_detection && !has_unknown_apis;
 
-        let raw_eta = if has_timing_data {
-            Some(calculate_initial_eta(&predictions, effective_workers, effective_gpu_jobs))
-        } else {
-            None
-        };
-
-        // Fudge factor for progress display ETA correction
-        let fudge_factor = if has_timing_data {
-            let cache = self.timing_cache.lock().unwrap();
-            self.build_type
-                .map(|bt| cache.average_fudge_factor(bt, test_files))
-                .unwrap_or(1.0)
-        } else {
-            1.0
-        };
-
-        if let Some(eta) = raw_eta {
-            self.stats.record_initial_prediction(eta, test_files.to_vec());
+        // Record initial ETA prediction
+        if params.has_timing_data {
+            let raw_eta = calculate_initial_eta(&predictions, params.workers, params.gpu_jobs);
+            self.stats.record_initial_prediction(raw_eta, test_files.to_vec());
         } else {
             *self.stats.test_files.lock().unwrap() = test_files.to_vec();
         }
@@ -1250,44 +1509,37 @@ impl TestRunner {
                 "{}",
                 format!(
                     "Batch config: max_size={}, max_duration={:.1}s",
-                    effective_batch_size, effective_batch_duration
+                    params.batch_size, params.batch_duration
                 ).dimmed()
             );
         }
 
+        // Create scheduler
         let (mut scheduler, scheduler_handle) = Scheduler::new(
             sorted_files,
-            effective_batch_size,
-            effective_workers,
+            params.batch_size,
+            params.workers,
             predictions,
-            has_timing_data,
-            effective_batch_duration,
-            effective_gpu_jobs,
+            params.has_timing_data,
+            params.batch_duration,
+            params.gpu_jobs,
             self.args.gpu_stagger,
         );
 
-        let stats = self.stats.clone();
-        let failures = self.failures.clone();
-        let retries = self.args.retries;
-        let retried_tests = self.retried_tests.clone();
-
+        // Shared state
         let running = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
-
         let timeout = Duration::from_secs(self.args.timeout);
-
         let worker_states = if !self.machine_output {
-            Some(Arc::new(WorkerStates::new(effective_workers)))
+            Some(Arc::new(WorkerStates::new(params.workers)))
         } else {
             None
         };
 
-        stats.mark_execution_started();
+        self.stats.mark_execution_started();
 
+        // Spawn scheduler thread
         debug_log!("about to spawn scheduler thread");
-
-        let scheduler_handle_for_check = scheduler_handle.clone();
         let scheduler_thread = thread::Builder::new()
             .name("scheduler".to_string())
             .spawn(move || {
@@ -1295,158 +1547,62 @@ impl TestRunner {
             })
             .expect("failed to spawn scheduler thread");
 
+        // Spawn progress thread
         debug_log!("scheduler thread spawned, about to spawn progress thread");
-
-        let progress_stats = stats.clone();
-        let progress_running = running.clone();
-        let progress_handle_for_progress = scheduler_handle.clone();
         let progress_shutdown = Arc::new(AtomicBool::new(false));
-        let progress_shutdown_clone = progress_shutdown.clone();
-        let total_files = test_files.len();
-        let machine_output = self.machine_output;
-        let num_workers = effective_workers;
-        let progress_worker_states = worker_states.clone();
-        let verbose_for_progress = self.args.verbose;
-        let progress_fudge_factor = fudge_factor;
-        let progress_handle = thread::spawn(move || {
-            let mut display = ProgressDisplay::new(total_files, machine_output, num_workers, verbose_for_progress, progress_fudge_factor);
-            let mut sys_stats: Option<SystemStats> = None;
-            let mut stats_counter = 0u32;
-            while !progress_shutdown_clone.load(Ordering::SeqCst) {
-                let files_done = progress_stats.files_completed();
-                let batches_running = progress_running.load(Ordering::SeqCst);
+        let progress_handle = spawn_progress_thread(
+            self.stats.clone(),
+            running.clone(),
+            scheduler_handle.clone(),
+            progress_shutdown.clone(),
+            test_files.len(),
+            self.machine_output,
+            params.workers,
+            self.args.verbose,
+            params.fudge_factor,
+            worker_states.clone(),
+        );
 
-                let status = progress_handle_for_progress.get_status();
-                let eta = if progress_handle_for_progress.has_timing_data {
-                    Some(status.eta)
-                } else {
-                    None
-                };
-                display.update(&progress_stats, files_done, batches_running, status.remaining, status.has_pending_batches, eta, progress_worker_states.as_deref());
-
-                stats_counter += 1;
-                if stats_counter >= 10 {
-                    stats_counter = 0;
-                    let sys = sys_stats.get_or_insert_with(SystemStats::new);
-                    sys.refresh_and_log(batches_running, status.remaining);
-                }
-
-                thread::sleep(Duration::from_millis(16));
-            }
-            display.finish(&progress_stats);
-        });
-
+        // Spawn workers and run main loop
         debug_log!("progress thread spawned, about to spawn workers");
-
-        let initial_status = scheduler_handle_for_check.get_status();
+        let initial_status = scheduler_handle.get_status();
         if !initial_status.is_empty {
-            for i in 0..effective_workers {
+            let mut handles = Vec::new();
+
+            for i in 0..params.workers {
                 debug_log!("spawning worker {}", i);
-                let slang_test = self.args.slang_test.as_ref().unwrap().clone();
-                let root_dir = self.args.root_dir_effective.clone();
                 let mut extra_args = self.args.extra_args.clone();
                 if skip_api_detection {
                     extra_args.push("-skip-api-detection".to_string());
                 }
-                let stats = stats.clone();
-                let failures = failures.clone();
-                let retried_tests = retried_tests.clone();
-                let handle_for_worker = scheduler_handle.clone();
-                let running = running.clone();
-                let shutdown = shutdown.clone();
-                let machine_output = self.machine_output;
-                let verbose = self.args.verbose;
-                let worker_states_clone = worker_states.clone();
 
-                let worker_id = i;
-                let handle = thread::Builder::new()
-                    .name(format!("worker-{}", worker_id))
-                    .spawn(move || {
-                    debug_log!("started, getting first batch");
-                    let my_state = worker_states_clone.as_ref().map(|ws| ws.get(worker_id));
-                    loop {
-                        if shutdown.load(Ordering::SeqCst) {
-                            debug_log!("shutdown flag set, exiting");
-                            break;
-                        }
-                        if is_interrupted() {
-                            debug_log!("interrupted, exiting");
-                            break;
-                        }
-
-                        let get_batch_start = Instant::now();
-                        if let Some(assignment) = handle_for_worker.get_batch() {
-                            let get_batch_time = get_batch_start.elapsed();
-                            if get_batch_time.as_millis() > 10 {
-                                debug_log!("get_batch took {:.3}s", get_batch_time.as_secs_f64());
-                            }
-                            debug_log!("got batch {} of {} tests ({:?})", assignment.batch_id, assignment.tests.len(), assignment.kind);
-                            run_batch_with_pool(
-                                &slang_test,
-                                &root_dir,
-                                &assignment.tests,
-                                &extra_args,
-                                timeout,
-                                &stats,
-                                &failures,
-                                retries,
-                                &retried_tests,
-                                &handle_for_worker,
-                                &running,
-                                machine_output,
-                                verbose,
-                                my_state,
-                            );
-                            debug_log!("batch {} completed, calling complete_batch", assignment.batch_id);
-                            handle_for_worker.complete_batch(assignment.batch_id);
-                            debug_log!("batch {} complete_batch done", assignment.batch_id);
-                        } else {
-                            let status = handle_for_worker.get_status();
-                            debug_log!("no batch available: batches={} pending={} in_flight={:?}",
-                                status.debug_state.0, status.debug_state.1, status.debug_state.2);
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                    }
-                    debug_log!("worker loop exited");
-                }).expect("failed to spawn worker thread");
+                let handle = spawn_worker_thread(
+                    i,
+                    self.args.slang_test.as_ref().unwrap().clone(),
+                    self.args.root_dir_effective.clone(),
+                    extra_args,
+                    timeout,
+                    self.stats.clone(),
+                    self.failures.clone(),
+                    self.args.retries,
+                    self.retried_tests.clone(),
+                    scheduler_handle.clone(),
+                    running.clone(),
+                    shutdown.clone(),
+                    self.args.verbose,
+                    worker_states.clone(),
+                );
                 handles.push(handle);
             }
 
             debug_log!("all workers spawned, entering main loop");
-
-            loop {
-                let status = scheduler_handle_for_check.get_status();
-                let running_count = running.load(Ordering::SeqCst);
-
-                if status.is_empty && running_count == 0 {
-                    debug_log!("main loop: scheduler empty and no batches running, exiting");
-                    break;
-                }
-
-                if is_interrupted() {
-                    debug_log!("main loop: interrupted, exiting");
-                    break;
-                }
-
-                static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let now_ms = DEBUG_START.elapsed().as_millis() as u64;
-                let last = LAST_LOG.load(Ordering::Relaxed);
-                if now_ms - last > 1000 {
-                    LAST_LOG.store(now_ms, Ordering::Relaxed);
-                    debug_log!("main loop: running={} batches={} pending={} in_flight={:?}",
-                        running_count, status.debug_state.0, status.debug_state.1, status.debug_state.2);
-                }
-
-                thread::sleep(Duration::from_millis(20));
-            }
-
-            debug_log!("main loop exited, setting shutdown flag");
-            shutdown.store(true, Ordering::SeqCst);
+            run_main_monitoring_loop(&scheduler_handle, &running, &shutdown);
 
             debug_log!("dropping worker handles");
             drop(handles);
         }
 
+        // Cleanup
         scheduler_handle.shutdown();
         let _ = scheduler_thread.join();
 

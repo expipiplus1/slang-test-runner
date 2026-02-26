@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::UnsupportedApis;
 use crate::debug_log;
@@ -67,7 +67,8 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     let (test_err_tx, test_err_rx) = bounded::<String>(1);
     let (api_tx, api_rx) = bounded::<UnsupportedApis>(1);
     let (timing_tx, timing_rx) = bounded::<TimingCache>(1);
-    let (compiling_tx, compiling_rx) = bounded::<()>(1);
+    // Unbounded since both dry-run and api-detection threads can send compiling signals
+    let (compiling_tx, compiling_rx) = crossbeam_channel::unbounded::<()>();
 
     // Interrupt signal channel - wakes up select! on Ctrl-C
     let (sig_tx, sig_rx) = bounded::<()>(1);
@@ -97,7 +98,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     spawn_test_discovery(
         test_tx,
         test_err_tx,
-        compiling_tx,
+        compiling_tx.clone(),
         config.slang_test.clone(),
         config.root_dir.clone(),
         config.filters.to_vec(),
@@ -107,7 +108,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     )?;
 
     if !config.no_early_api_check {
-        spawn_api_detection(api_tx, config.slang_test.clone(), config.root_dir.clone());
+        spawn_api_detection(api_tx, compiling_tx, config.slang_test.clone(), config.root_dir.clone());
     }
 
     if !config.no_timing_cache {
@@ -144,7 +145,8 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         Some(pb)
     };
 
-    let mut shown_compiling = false;
+    let mut is_compiling = false;
+    let mut compiling_started: Option<Instant> = None;
     let mut dirty = false;
     let mut has_tests = false;
 
@@ -214,6 +216,11 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
                     tests.push(test);
                     dirty = true;
                     has_tests = true;
+                    // Tests arriving means compilation finished
+                    if is_compiling {
+                        is_compiling = false;
+                        compiling_started = None;
+                    }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -276,13 +283,13 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
             Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
-        if compiling_rx.try_recv().is_ok() && !shown_compiling {
-            if *DEBUG_ENABLED {
-                eprintln!("{}", "Compiling core module...".dimmed());
-            } else if let Some(ref pb) = discovery_pb {
-                pb.set_message("Compiling core module...".dimmed().to_string());
+        // Check for compiling signals (from either dry-run or api-detection)
+        while compiling_rx.try_recv().is_ok() {
+            if !is_compiling {
+                is_compiling = true;
+                compiling_started = Some(Instant::now());
+                dirty = true;
             }
-            shown_compiling = true;
         }
 
         // 2. Check for errors
@@ -298,22 +305,72 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         }
 
         // 4. Update progress display
-        if dirty && has_tests {
-            let displayed_workers = config.num_workers.min(display_count.max(1));
-            let has_timing = !timing_cache.timings_by_build.is_empty();
-            let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
-            let msg = format_running_message(display_count, displayed_workers, eta, display_ignored);
-            debug_log!("progress: {} tests, {} ignored, {} total raw", display_count, display_ignored, tests.len());
-            if *DEBUG_ENABLED {
-                // In debug mode, print with newline so it doesn't interfere with debug output
-                eprintln!("{}", msg);
-            } else if let Some(ref pb) = discovery_pb {
-                pb.set_message(msg);
+        // Show "Running X tests" when we have tests, or "Compiling..." when compiling before tests arrive
+        if dirty && (has_tests || is_compiling) {
+            if has_tests {
+                let displayed_workers = config.num_workers.min(display_count.max(1));
+                let has_timing = !timing_cache.timings_by_build.is_empty();
+                let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
+                let compiling_secs = compiling_started.map(|t| t.elapsed().as_secs_f64());
+                let msg = format_running_message(display_count, displayed_workers, eta, display_ignored, compiling_secs);
+                debug_log!("progress: {} tests, {} ignored, {} total raw, compiling={}", display_count, display_ignored, tests.len(), is_compiling);
+                if *DEBUG_ENABLED {
+                    eprintln!("{}", msg);
+                } else if let Some(ref pb) = discovery_pb {
+                    pb.set_message(msg);
+                }
+            } else if is_compiling {
+                // Compiling before any tests arrived - show compiling message
+                let compiling_secs = compiling_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                let msg = format!("{}", format!("Compiling core module... ({:.0}s)", compiling_secs).dimmed());
+                debug_log!("compiling (no tests yet): {:.0}s", compiling_secs);
+                if *DEBUG_ENABLED {
+                    eprintln!("{}", msg);
+                } else if let Some(ref pb) = discovery_pb {
+                    pb.set_message(msg);
+                }
             }
             dirty = false;
         }
 
         // 5. Park until data arrives, disconnect, or interrupt
+        // Use select! with timeout when compiling to keep timer updated
+        if is_compiling {
+            select! {
+                recv(test_rx) -> msg => {
+                    match msg {
+                        Ok(test) => {
+                            accumulate_prediction(&test, &timing_cache, config.build_type, &mut total_predicted, &mut longest_test);
+                            if display_apis.is_test_unsupported(&test) {
+                                display_ignored += 1;
+                            } else {
+                                display_count += 1;
+                            }
+                            tests.push(test);
+                            dirty = true;
+                            has_tests = true;
+                            is_compiling = false;
+                            compiling_started = None;
+                        }
+                        Err(_) => {
+                            test_channel_closed = true;
+                        }
+                    }
+                }
+                recv(compiling_rx) -> _ => {
+                    // Already compiling, ignore additional signals
+                }
+                recv(sig_rx) -> _ => {
+                    break;
+                }
+                default(Duration::from_millis(16)) => {
+                    // Timeout to update compiling timer at same rate as progress display
+                    dirty = true;
+                }
+            }
+            continue;
+        }
+
         // Use select! to wait on all channels simultaneously
         select! {
             recv(test_rx) -> msg => {
@@ -329,6 +386,11 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
                         tests.push(test);
                         dirty = true;
                         has_tests = true;
+                        // Tests arriving means compilation finished
+                        if is_compiling {
+                            is_compiling = false;
+                            compiling_started = None;
+                        }
                     }
                     Err(_) => {
                         if !test_channel_closed {
@@ -392,15 +454,12 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
                 }
             }
             recv(compiling_rx) -> msg => {
-                // Only show compiling message if we actually received a signal (not channel close)
-                if msg.is_ok() && !shown_compiling {
+                // Only update compiling state if we actually received a signal (not channel close)
+                if msg.is_ok() && !is_compiling {
                     debug_log!("compiling signal received");
-                    if *DEBUG_ENABLED {
-                        eprintln!("{}", "Compiling core module...".dimmed());
-                    } else if let Some(ref pb) = discovery_pb {
-                        pb.set_message("Compiling core module...".dimmed().to_string());
-                    }
-                    shown_compiling = true;
+                    is_compiling = true;
+                    compiling_started = Some(Instant::now());
+                    dirty = true;
                 }
             }
             recv(sig_rx) -> _ => {
@@ -477,10 +536,14 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
     // Finish progress bar and print final summary with newline
     if let Some(pb) = discovery_pb {
         pb.finish_and_clear();
-        let displayed_workers = config.num_workers.min(filtered_tests.len().max(1));
-        let has_timing = !timing_cache.timings_by_build.is_empty();
-        let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
-        eprintln!("{}", format_running_message(filtered_tests.len(), displayed_workers, eta, api_ignored_count));
+        // Only print final "Running X tests" message if not interrupted
+        if !is_interrupted() {
+            let displayed_workers = config.num_workers.min(filtered_tests.len().max(1));
+            let has_timing = !timing_cache.timings_by_build.is_empty();
+            let eta = compute_display_eta(total_predicted, longest_test, displayed_workers, fudge_factor, has_timing);
+            // Final message never shows compiling (discovery is done)
+            eprintln!("{}", format_running_message(filtered_tests.len(), displayed_workers, eta, api_ignored_count, None));
+        }
     }
 
     debug_log!("discovery complete");
@@ -653,7 +716,12 @@ fn spawn_test_discovery(
 }
 
 /// Spawn the API detection thread
-fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_dir: PathBuf) {
+fn spawn_api_detection(
+    tx: Sender<UnsupportedApis>,
+    compiling_tx: Sender<()>,
+    slang_test: PathBuf,
+    root_dir: PathBuf,
+) {
     thread::Builder::new()
         .name("api-detection".to_string())
         .spawn(move || {
@@ -692,6 +760,26 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
                 return;
             }
         };
+
+        // Also capture stderr for compiling messages
+        let stderr = child.stderr.take();
+        if let Some(stderr) = stderr {
+            let compiling_tx_clone = compiling_tx.clone();
+            thread::Builder::new()
+                .name("api-detection-stderr".to_string())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            if line.contains("Compiling core module") {
+                                debug_log!("api-detection stderr triggered compiling: {:?}", line);
+                                let _ = compiling_tx_clone.send(());
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn api-detection-stderr thread");
+        }
 
         let reader = BufReader::new(stdout);
         let mut saw_any_check = false;
@@ -746,7 +834,10 @@ fn spawn_api_detection(tx: Sender<UnsupportedApis>, slang_test: PathBuf, root_di
         } else if !saw_any_check {
             // Old slang-test or error - just warn and continue without API info
             unsupported.check_completed = false;
-            eprintln!("{}", "Warning: slang-test does not support -only-api-detection, API detection skipped".dimmed());
+            // Only warn if not interrupted (otherwise it's expected to have no output)
+            if !is_interrupted() {
+                eprintln!("{}", "Warning: slang-test does not support -only-api-detection, API detection skipped".dimmed());
+            }
         } else {
             // Saw some Check lines but no "Not checked" sentinel - partial result
             unsupported.check_completed = false;
@@ -785,6 +876,7 @@ pub(crate) fn format_running_message(
     num_workers: usize,
     predicted_eta: Option<f64>,
     api_ignored: usize,
+    compiling_secs: Option<f64>,
 ) -> String {
     let ignored_part = if api_ignored > 0 {
         format!(
@@ -795,17 +887,23 @@ pub(crate) fn format_running_message(
         String::new()
     };
 
+    let compiling_part = match compiling_secs {
+        Some(secs) => format!(" {}", format!("Compiling core module... ({:.0}s)", secs).dimmed()),
+        None => String::new(),
+    };
+
     match predicted_eta {
         Some(eta) => format!(
-            "Running {} tests with {} workers{} {}",
+            "Running {} tests with {} workers{} {}{}",
             num_tests,
             num_workers,
             ignored_part,
-            format!("(predicted ETA {:.0}s)", eta).dimmed()
+            format!("(predicted ETA {:.0}s)", eta).dimmed(),
+            compiling_part
         ),
         None => format!(
-            "Running {} tests with {} workers{}",
-            num_tests, num_workers, ignored_part
+            "Running {} tests with {} workers{}{}",
+            num_tests, num_workers, ignored_part, compiling_part
         ),
     }
 }
