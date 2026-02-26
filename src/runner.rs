@@ -1922,20 +1922,28 @@ impl TestRunner {
                 }
             } else {
                 let pass_pct = (passed as f64 / total_run as f64) * 100.0;
+                // Use 1 decimal place for partial results to avoid misleading 0%/100%
+                let pct_str = if passed == 0 {
+                    "0".to_string()
+                } else if passed == total_run {
+                    "100".to_string()
+                } else {
+                    format!("{:.1}", pass_pct)
+                };
                 if failed == 0 {
                     println!(
-                        "{}: {:.0}% passed ({} passed, {} ignored) in {:.1}s",
+                        "{}: {}% passed ({} passed, {} ignored) in {:.1}s",
                         "OK".green().bold(),
-                        pass_pct,
+                        pct_str,
                         passed,
                         ignored,
                         elapsed.as_secs_f64()
                     );
                 } else {
                     println!(
-                        "{}: {:.0}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
+                        "{}: {}% passed ({} passed, {} failed, {} ignored) in {:.1}s",
                         "FAILED".red().bold(),
-                        pass_pct,
+                        pct_str,
                         passed,
                         failed,
                         ignored,

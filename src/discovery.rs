@@ -588,16 +588,28 @@ fn spawn_test_discovery(
     apis: Vec<String>,
     ignore_apis: Vec<String>,
 ) -> Result<()> {
-    // Compile filter regexes upfront
-    let filter_regexes: Vec<Regex> = filters
-        .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("Invalid filter regex: {}", p)))
-        .collect::<Result<Vec<_>>>()?;
+    // Combine patterns into single alternation regex for better performance.
+    // Must validate each pattern first - wrapping in (?:...) can "fix" invalid patterns
+    // (e.g., ")(" is invalid, but "(?:)()" is valid).
+    fn combine_patterns(patterns: &[String], desc: &str) -> Result<Option<Regex>> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        // Validate each pattern individually
+        for p in patterns {
+            Regex::new(p).with_context(|| format!("Invalid {} regex: {}", desc, p))?;
+        }
+        // Combine into single alternation: (?:pat1)|(?:pat2)|...
+        let combined = patterns
+            .iter()
+            .map(|p| format!("(?:{})", p))
+            .collect::<Vec<_>>()
+            .join("|");
+        Ok(Some(Regex::new(&combined)?))
+    }
 
-    let ignore_regexes: Vec<Regex> = ignore_patterns
-        .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("Invalid ignore regex: {}", p)))
-        .collect::<Result<Vec<_>>>()?;
+    let filter_regex = combine_patterns(&filters, "filter")?;
+    let ignore_regex = combine_patterns(&ignore_patterns, "ignore")?;
 
     log_event(
         "dry_run",
@@ -673,12 +685,12 @@ fn spawn_test_discovery(
             }
 
             // Apply ignore patterns (regex) - these are user-specified ignores
-            if ignore_regexes.iter().any(|re| re.is_match(line)) {
+            if ignore_regex.as_ref().is_some_and(|re| re.is_match(line)) {
                 continue;
             }
 
             // Apply filter patterns (regex) - test must match at least one filter
-            if !filter_regexes.is_empty() && !filter_regexes.iter().any(|re| re.is_match(line)) {
+            if filter_regex.as_ref().is_some_and(|re| !re.is_match(line)) {
                 continue;
             }
 

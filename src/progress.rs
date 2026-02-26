@@ -249,13 +249,13 @@ impl ProgressDisplay {
             };
 
             let stuck_info = if let Some(secs) = stats.seconds_since_last_output() {
-                if secs > 1.0 {
-                    format!(" \x1b[2m[waiting {:.0}s]\x1b[0m", secs)
+                if secs >= 5.0 {
+                    format!(" \x1b[2m[no output for {:.0}s]\x1b[0m", secs)
                 } else {
                     String::new()
                 }
             } else {
-                " \x1b[2m[no timer]\x1b[0m".to_string()
+                String::new()
             };
 
             let load_info = if self.verbose {

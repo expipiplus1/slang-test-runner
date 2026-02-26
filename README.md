@@ -74,9 +74,6 @@ sti --dry-run diagnostic
 # Customize parallelism
 sti -j 8
 
-# Use difft for side-by-side diffs
-sti --diff difft
-
 # Ignore tests matching a pattern
 sti --ignore 'compute'
 
