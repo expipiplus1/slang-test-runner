@@ -57,8 +57,6 @@ pub struct BatchAssignment {
 struct InFlightBatch {
     test_count: usize,
     kind: BatchKind,
-    /// Predicted time for this batch (sum of test predictions)
-    predicted_time: f64,
     /// Predicted time remaining (updated as tests complete)
     remaining_predicted: f64,
 }
@@ -101,6 +99,8 @@ pub struct Scheduler {
     completed_predicted: f64,
     /// Cumulative actual time for completed tests
     completed_actual: f64,
+    /// Previous ETA value (for smoothing - ETA should never increase)
+    prev_eta: f64,
 }
 
 impl Scheduler {
@@ -155,6 +155,7 @@ impl Scheduler {
             initial_total_predicted: total_predicted,
             completed_predicted: 0.0,
             completed_actual: 0.0,
+            prev_eta: f64::MAX,
         };
 
         let handle = SchedulerHandle {
@@ -197,7 +198,7 @@ impl Scheduler {
     }
 
     /// Get atomic status snapshot
-    fn get_status(&self, num_workers: usize) -> SchedulerStatus {
+    fn get_status(&mut self, num_workers: usize) -> SchedulerStatus {
         let pool_count: usize = self.batches.iter()
             .map(|b| b.tests.len()).sum::<usize>()
             + self.pending_files.len();
@@ -547,7 +548,6 @@ impl Scheduler {
         self.in_flight.insert(batch_id, InFlightBatch {
             test_count,
             kind,
-            predicted_time: predicted_duration,
             remaining_predicted: predicted_duration,
         });
 
@@ -578,7 +578,7 @@ impl Scheduler {
     }
 
     /// Calculate estimated time remaining.
-    fn calculate_eta(&self, num_workers: usize) -> f64 {
+    fn calculate_eta(&mut self, num_workers: usize) -> f64 {
         if self.initial_total_predicted <= 0.0 {
             return 0.0;
         }
@@ -594,22 +594,28 @@ impl Scheduler {
 
         // Total remaining = pool (not yet dispatched) + in-flight remaining
         let remaining = self.pool_predicted + in_flight_remaining;
-        let eta = remaining.max(0.0) / effective_workers as f64;
+        let raw_eta = remaining.max(0.0) / effective_workers as f64;
 
-        // Debug output
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static LAST_DEBUG: AtomicU64 = AtomicU64::new(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let last = LAST_DEBUG.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) >= 500 {
-            LAST_DEBUG.store(now_ms, Ordering::Relaxed);
-            eprintln!(
-                "[ETA] eta={:.1}s eff_workers={} batches={} pool={:.1}s in_flight={:.1}s",
-                eta, effective_workers, total_batches, self.pool_predicted, in_flight_remaining
-            );
+        // Smooth: ETA should never increase (take minimum of current and previous)
+        let eta = raw_eta.min(self.prev_eta);
+        self.prev_eta = eta;
+
+        // Debug output (only when STI_DEBUG is set)
+        if *crate::types::DEBUG_ENABLED {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_DEBUG: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_DEBUG.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= 500 {
+                LAST_DEBUG.store(now_ms, Ordering::Relaxed);
+                eprintln!(
+                    "[ETA] eta={:.1}s eff_workers={} batches={} pool={:.1}s in_flight={:.1}s",
+                    eta, effective_workers, total_batches, self.pool_predicted, in_flight_remaining
+                );
+            }
         }
 
         eta
