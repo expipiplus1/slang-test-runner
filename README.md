@@ -1,6 +1,6 @@
 # Slang Test Interceptor
 
-> Better get tested!
+> STI testing could save you a lot of hassle
 
 A wrapper for slang-test which implements several enhancements.
 
