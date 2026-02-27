@@ -395,21 +395,44 @@ pub fn extract_base_test_file(test_name: &str) -> Option<String> {
 /// Examples:
 ///   - Single variant: "tests/foo.slang.0"
 ///   - Multiple variants: "tests/foo.slang.(0|2|5)"
+///   - No variants (internal test): "slang-unit-test-tool/foo.internal"
 pub fn minimize_test_filters(test_names: &[&str]) -> Vec<String> {
+    // Helper: check if path is a source file (has variants)
+    fn is_source_file(path: &str) -> bool {
+        path.ends_with(".slang") || path.ends_with(".hlsl")
+            || path.ends_with(".glsl") || path.ends_with(".c")
+    }
+
     // Group by base file, tracking variant numbers
-    let mut by_base_file: HashMap<String, Vec<Option<u32>>> = HashMap::new();
+    // Normalize None -> Some(0) for source files (slang-test omits .0 in output)
+    let mut by_base_file: HashMap<String, Vec<u32>> = HashMap::new();
     for name in test_names {
         let test_id = TestId::parse(name);
+        let variant = match test_id.variant {
+            Some(v) => v,
+            None if is_source_file(&test_id.path) => 0,
+            None => {
+                // Internal test or other non-source file - no variant
+                by_base_file.entry(test_id.path.clone()).or_default();
+                continue;
+            }
+        };
         by_base_file
             .entry(test_id.path.clone())
             .or_default()
-            .push(test_id.variant);
+            .push(variant);
     }
 
     let mut result: Vec<String> = Vec::new();
     for (base_path, variants) in &by_base_file {
+        if variants.is_empty() {
+            // No variant number (e.g., internal test)
+            result.push(base_path.clone());
+            continue;
+        }
+
         // Deduplicate variants (same variant can fail multiple times with different APIs)
-        let mut unique_variants: Vec<Option<u32>> = variants.iter().copied().collect();
+        let mut unique_variants: Vec<u32> = variants.iter().copied().collect();
         unique_variants.sort();
         unique_variants.dedup();
 
@@ -417,19 +440,12 @@ pub fn minimize_test_filters(test_names: &[&str]) -> Vec<String> {
             // Multiple variants - build regex pattern: tests/foo.slang.(0|2|5)
             let variant_alts: Vec<String> = unique_variants
                 .iter()
-                .filter_map(|v| v.map(|n| n.to_string()))
+                .map(|v| v.to_string())
                 .collect();
-            if !variant_alts.is_empty() {
-                result.push(format!("{}.({})", base_path, variant_alts.join("|")));
-            } else {
-                result.push(base_path.clone());
-            }
-        } else if let Some(Some(variant)) = unique_variants.first() {
-            // Single variant with number
-            result.push(format!("{}.{}", base_path, variant));
+            result.push(format!("{}.({})", base_path, variant_alts.join("|")));
         } else {
-            // No variant number (e.g., internal test)
-            result.push(base_path.clone());
+            // Single variant
+            result.push(format!("{}.{}", base_path, unique_variants[0]));
         }
     }
     result.sort();
