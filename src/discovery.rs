@@ -555,7 +555,7 @@ pub fn run_concurrent_discovery(config: &DiscoveryConfig) -> Result<DiscoveryRes
         if let Some(ref err) = apis.error {
             eprintln!(
                 "{}",
-                format!("Warning: API detection: {}", err).dimmed()
+                format!("Warning: {}", err).dimmed()
             );
         }
     }
@@ -848,9 +848,9 @@ fn spawn_api_detection(
         } else if !saw_any_check {
             // Old slang-test or error - just warn and continue without API info
             unsupported.check_completed = false;
-            // Only warn if not interrupted (otherwise it's expected to have no output)
+            // Store warning to be printed after progress bar clears (not from this thread)
             if !is_interrupted() {
-                eprintln!("{}", "Warning: slang-test does not support -only-api-detection, API detection skipped".dimmed());
+                unsupported.error = Some("slang-test does not support -only-api-detection, API detection skipped".to_string());
             }
         } else {
             // Saw some Check lines but no "Not checked" sentinel - partial result
