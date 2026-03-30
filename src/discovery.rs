@@ -649,6 +649,24 @@ fn spawn_test_discovery(
         Ok(Some(Regex::new(&combined)?))
     }
 
+    // Preprocess filters: if a filter looks like "tests/foo.slang.0", slang-test
+    // may output the test without ".0" for single-subtest tests. Transform such
+    // filters to match both with and without ".0".
+    let filters: Vec<String> = filters
+        .into_iter()
+        .map(|f| {
+            let test_id = crate::types::TestId::parse(&f);
+            if test_id.variant == Some(0) {
+                // "tests/foo.slang.0" -> match both "tests/foo.slang.0" and "tests/foo.slang"
+                // but NOT "tests/foo.slang.1". Require whitespace or end-of-string after
+                // the optional ".0" so we don't accidentally match other variants.
+                format!("{}(\\.0)?(?:\\s|$)", regex::escape(&test_id.path))
+            } else {
+                f
+            }
+        })
+        .collect();
+
     let filter_regex = combine_patterns(&filters, "filter")?;
     let ignore_regex = combine_patterns(&ignore_patterns, "ignore")?;
 

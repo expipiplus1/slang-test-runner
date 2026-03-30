@@ -443,8 +443,12 @@ pub fn minimize_test_filters(test_names: &[&str]) -> Vec<String> {
                 .map(|v| v.to_string())
                 .collect();
             result.push(format!("{}.({})", base_path, variant_alts.join("|")));
+        } else if unique_variants[0] == 0 {
+            // Single variant 0 - use bare path. slang-test omits .0 for tests with
+            // only one subtest, so "tests/foo.slang" is the canonical form.
+            result.push(base_path.clone());
         } else {
-            // Single variant
+            // Single non-zero variant
             result.push(format!("{}.{}", base_path, unique_variants[0]));
         }
     }
